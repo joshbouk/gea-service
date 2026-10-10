@@ -82,16 +82,6 @@ def fixture(job_type: str) -> tuple[int, dict]:
                       "free_text_in_picklist": random.randint(0, 3)},
         }
 
-    if job_type == "propose_mappings":
-        proposed = random.randint(40, 110)
-        high, medium = int(proposed * 0.62), int(proposed * 0.24)
-        return proposed, {
-            "proposed": proposed,
-            "confidence": {"high": high, "medium": medium,
-                           "low": proposed - high - medium},
-            "unmapped_cap_bearing": random.randint(0, 3),
-        }
-
     if job_type.startswith("analysis:"):
         population = random.randint(300, 1800)
         return population, {"analysis_key": job_type.split(":", 1)[1],
@@ -208,6 +198,37 @@ def work_one(conn: psycopg.Connection) -> bool:
         log(f"succeeded {job_type}  {output['row_count']} rows, "
             f"{output['column_count']} columns, "
             f"{output['malformed_rows']} unreadable")
+        return True
+
+    if job_type == "propose_mappings":
+        with conn.cursor() as cur:
+            cur.execute("select engagement_id from analysis_run where id = %s",
+                        (run_id,))
+            engagement_id = cur.fetchone()[0]
+        conn.rollback()
+        try:
+            total, output = realjobs.propose_mappings(
+                conn, engagement_id, heartbeat)
+        except ValueError as exc:
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute("update analysis_run set status='failed', "
+                            "finished_at=now(), error=%s where id=%s",
+                            (str(exc), run_id))
+            conn.commit()
+            log(f"failed    {job_type}  {exc}")
+            return True
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "update analysis_run set status='succeeded', finished_at=now(), "
+                "progress_done=%s, progress_total=%s, compute_output=%s::jsonb, "
+                "model_name=%s where id=%s",
+                (total, total, json.dumps(output), realjobs.VERSION, run_id))
+        conn.commit()
+        log(f"succeeded {job_type}  {output['auto_accepted']} matched, "
+            f"{output['needs_review']} to review, "
+            f"{output['no_match_found']} with no match")
         return True
 
     try:

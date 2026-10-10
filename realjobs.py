@@ -122,3 +122,106 @@ def record_parse_failure(conn, artefact_id: str, reason: str) -> None:
                values (%s, 'failed', %s)""",
             (artefact_id, json.dumps({"reason": reason})))
     conn.commit()
+
+
+def propose_mappings(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
+    """Match the client's columns to the canonical vocabulary.
+
+    Proposes; never decides. A mapping a person has already confirmed,
+    corrected or marked unmapped is left exactly as they left it — running
+    this again after a new export arrives must not quietly undo someone's
+    work.
+    """
+    import mapping
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            select cf.id, cf.key, cf.description, cf.expected_type,
+                   cf.is_cap_bearing, cf.source_export_refs
+              from canonical_field cf
+              join engagement e on e.instrument_version_id = cf.instrument_version_id
+             where e.id = %s
+             order by cf.key""", (engagement_id,))
+        fields = cur.fetchall()
+
+        # Every column of every file uploaded for this engagement, carrying
+        # the export line it came from so a field is only matched against the
+        # file it could possibly be in.
+        cur.execute("""
+            select p.field_name, p.inferred_type, p.populated_rate,
+                   p.populated_count, p.distinct_count, d.id, el.ref
+              from dataset_field_profile p
+              join dataset d on d.id = p.dataset_id
+              join artefact a on a.id = d.artefact_id
+              join export_request_line erl on erl.id = a.export_request_line_id
+              join export_line el on el.id = erl.export_line_id
+             where a.engagement_id = %s and a.purged_at is null
+               and d.parse_status = 'parsed'""", (engagement_id,))
+        columns = [mapping.Column(r[0], r[1], float(r[2]), r[3], r[4],
+                                  str(r[5]), r[6]) for r in cur.fetchall()]
+
+        cur.execute("""select canonical_field_id from field_mapping
+                        where engagement_id = %s
+                          and status in ('confirmed','corrected','unmapped')""",
+                    (engagement_id,))
+        settled = {str(r[0]) for r in cur.fetchall()}
+    conn.rollback()
+
+    if not columns:
+        raise ValueError(
+            "no client export has been read yet, so there are no columns to "
+            "match against")
+
+    by_export: dict[str, list] = {}
+    for col in columns:
+        by_export.setdefault(col.export_ref, []).append(col)
+
+    proposals, skipped = [], 0
+    for i, (fid, key, description, expected, cap_bearing, refs) in enumerate(fields, 1):
+        if str(fid) in settled:
+            skipped += 1
+            continue
+        # Only look in the exports this field comes from. A loss reason lives
+        # in the deals file and is never matched against a contact export.
+        candidates = [c for ref in (refs or []) for c in by_export.get(ref, [])]
+        proposals.append(mapping.propose(
+            key, description, expected, cap_bearing, str(fid), candidates))
+        if i % 10 == 0:
+            heartbeat(i, len(fields))
+
+    with conn.cursor() as cur:
+        for p in proposals:
+            cur.execute("""
+                insert into field_mapping (engagement_id, canonical_field_id,
+                       dataset_id, proposed_field_name, confidence,
+                       evidence_note, candidate_alternatives, status)
+                values (%s,%s,%s,%s,%s,%s,%s,%s)
+                on conflict (engagement_id, canonical_field_id) do update
+                   set dataset_id = excluded.dataset_id,
+                       proposed_field_name = excluded.proposed_field_name,
+                       confidence = excluded.confidence,
+                       evidence_note = excluded.evidence_note,
+                       candidate_alternatives = excluded.candidate_alternatives,
+                       status = excluded.status
+                 where field_mapping.status in ('proposed','auto_accepted')""",
+                (engagement_id, p.canonical_field_id, p.dataset_id,
+                 p.proposed_field_name, p.confidence, p.evidence_note,
+                 json.dumps(p.alternatives), p.status))
+    conn.commit()
+
+    auto = sum(1 for p in proposals if p.status == "auto_accepted")
+    unmatched = sum(1 for p in proposals if p.proposed_field_name is None)
+    needs_eyes = sum(1 for p in proposals
+                     if p.status == "proposed" and p.proposed_field_name)
+    cap_bearing = sum(1 for p in proposals if p.is_cap_bearing)
+
+    heartbeat(len(fields), len(fields))
+    return len(fields), {
+        "fields_considered": len(fields),
+        "already_settled": skipped,
+        "auto_accepted": auto,
+        "needs_review": needs_eyes,
+        "no_match_found": unmatched,
+        "cap_bearing_in_review": cap_bearing,
+        "columns_searched": len(columns),
+    }
