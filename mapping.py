@@ -31,9 +31,9 @@ from difflib import SequenceMatcher
 NOISE = {"the", "of", "a", "field", "value", "custom", "property",
          "hs", "sf", "c", "x"}
 
-# Confidence bands. A proposal below LOW is not offered at all: a bad
-# suggestion costs more attention than no suggestion.
-HIGH, MEDIUM, MEDIUM_LOW, FLOOR = 0.92, 0.75, 0.55, 0.55
+# Confidence bands. Nothing below medium is offered at all: a weak suggestion
+# costs more attention than no suggestion, and teaches people to skim.
+HIGH, MEDIUM, MEDIUM_LOW, FLOOR = 0.92, 0.75, 0.55, 0.75
 
 
 def normalise(name: str) -> str:
@@ -47,9 +47,25 @@ def normalise(name: str) -> str:
     return " ".join(s.lower().split())
 
 
+def stem(word: str) -> str:
+    """Reduce a word to its root, crudely but enough.
+
+    A canonical key says created_at where the client's column says Create
+    Date. Treating those as unrelated words made a correct match score low
+    enough to be thrown away, which is a bug wearing the costume of caution.
+    """
+    for suffix in ("ies", "ied"):
+        if len(word) > 4 and word.endswith(suffix):
+            return word[:-3] + "y"
+    for suffix in ("ing", "ed", "es", "s", "d"):
+        if len(word) > 3 and word.endswith(suffix):
+            return word[: -len(suffix)]
+    return word
+
+
 def tokens(name: str) -> set[str]:
-    return {t for t in normalise(name).split() if t not in NOISE} or \
-           set(normalise(name).split())
+    words = [stem(w) for w in normalise(name).split()]
+    return {w for w in words if w not in NOISE} or set(words)
 
 
 ENTITIES = {"opportunity", "account", "contact", "subscription", "deal",
@@ -83,7 +99,8 @@ def similarity(canonical: str, column: str) -> float:
 
 
 def _similarity(canonical: str, column: str) -> float:
-    a, b = normalise(canonical), normalise(column)
+    a = " ".join(stem(w) for w in normalise(canonical).split())
+    b = " ".join(stem(w) for w in normalise(column).split())
     if not a or not b:
         return 0.0
     if a == b:
