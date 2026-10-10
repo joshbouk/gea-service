@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 
 # Words that appear in so many CRM column names they carry no signal.
-NOISE = {"the", "of", "a", "id", "field", "value", "custom", "property",
+NOISE = {"the", "of", "a", "field", "value", "custom", "property",
          "hs", "sf", "c", "x"}
 
 # Confidence bands. A proposal below LOW is not offered at all: a bad
@@ -76,11 +76,9 @@ def similarity(canonical: str, column: str) -> float:
     best = _similarity(canonical, column)
     words = normalise(canonical).split()
     if len(words) > 1 and words[0] in ENTITIES:
-        rest = words[1:]
-        # Only drop the entity when what remains still names something. An
-        # amount or an annual revenue is distinctive on its own; a name is not.
-        if not all(w in STRUCTURAL for w in rest):
-            best = max(best, _similarity(" ".join(rest), column))
+        # Dropping the entity helps find the column at all. It can no longer
+        # cause a silent accept, because only an exact name does that.
+        best = max(best, _similarity(" ".join(words[1:]), column))
     return best
 
 
@@ -98,6 +96,12 @@ def _similarity(canonical: str, column: str) -> float:
     contains = 1.0 if ta and ta <= tb else 0.0
     sequence = SequenceMatcher(None, a, b).ratio()
 
+    # Extra words dilute a containment match. Two or three are a CRM being
+    # verbose; ten mean the column is measuring something about the field
+    # rather than being it.
+    if contains and len(tb) > len(ta):
+        contains *= max(0.0, 1.0 - 0.18 * (len(tb) - len(ta)))
+
     return max(contains * 0.95, overlap * 0.9 + sequence * 0.1, sequence * 0.85)
 
 
@@ -112,6 +116,20 @@ class Column:
     export_ref: str
 
 
+def is_exact(canonical_key: str, column_name: str) -> bool:
+    """Is the column named this field, allowing for the entity prefix?
+
+    contact_job_title and a column called "Job Title" are the same thing.
+    contact_id and a column called "Contact Source" are not, however well
+    they score.
+    """
+    a, b = normalise(canonical_key), normalise(column_name)
+    if a == b:
+        return True
+    words = a.split()
+    return len(words) > 1 and words[0] in ENTITIES and " ".join(words[1:]) == b
+
+
 @dataclass
 class Proposal:
     canonical_field_id: str
@@ -123,25 +141,29 @@ class Proposal:
     alternatives: list[dict]
     is_cap_bearing: bool
     proposed_is_empty: bool = False
+    proposed_is_exact: bool = False
 
     @property
     def status(self) -> str:
-        """High confidence maps itself. Two things stop it.
+        """Only an exact name maps itself. Everything else waits for a person.
 
-        A cap-bearing field always waits for a person, because the cost of
-        getting one wrong is a score ceiling nobody chose.
+        Confidence alone is not enough. A column called "Contact Source"
+        scores highly against contact_id and is a different thing entirely,
+        and a silent wrong mapping is the most expensive mistake this screen
+        can make: it is never reviewed, and every figure built on it is wrong
+        in a way nobody traces back.
 
-        A column that is empty in every row waits too, however exactly its
-        name matches. "The field exists and nobody fills it in" is a finding
-        about how the client works, and somebody has to decide whether that
-        counts as mapped or as absent. Accepting it silently means the first
-        anyone hears of it is an analysis returning nothing.
+        Two further things stop even an exact name from accepting itself. A
+        cap-bearing field, because the cost of getting one wrong is a score
+        ceiling nobody chose. And a column empty in every row, because "the
+        field exists and nobody fills it in" is a finding somebody has to
+        rule on.
         """
         if self.proposed_field_name is None:
             return "proposed"
         if self.is_cap_bearing or self.proposed_is_empty:
             return "proposed"
-        return "auto_accepted" if self.confidence == "high" else "proposed"
+        return "auto_accepted" if self.proposed_is_exact else "proposed"
 
 
 TYPE_AGREEMENT = {
@@ -234,6 +256,7 @@ def propose(canonical_key: str, description: str | None,
         canonical_field_id, canonical_key, best.dataset_id, best.name,
         band(best_score), note,
         proposed_is_empty=best.populated_count == 0,
+        proposed_is_exact=is_exact(canonical_key, best.name),
         alternatives=[{"field_name": c.name,
                        "confidence": band(s),
                        "populated_rate": round(c.populated_rate, 4),
