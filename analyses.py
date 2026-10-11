@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import csv
 from collections import Counter, defaultdict
+from datetime import datetime
 from dataclasses import dataclass, field
 
 import csvjobs
@@ -587,10 +588,357 @@ def price_discount_dispersion(conn, engagement_id: str, heartbeat):
     }
 
 
+def a_date(value):
+    """A date, or None. Several shapes, because clients export all of them."""
+    t = (str(value) if value is not None else "").strip()
+    if not t:
+        return None
+    t = t.replace("T", " ").split(" ")[0].split("+")[0]
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(t, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def a_month(value) -> str | None:
+    d = a_date(value)
+    if d:
+        return f"{d.year:04d}-{d.month:02d}"
+    t = (str(value) if value is not None else "").strip()
+    # Spend files often carry the month alone.
+    if len(t) == 7 and t[4] in "-/" and t[:4].isdigit():
+        return f"{t[:4]}-{t[5:7]}"
+    return None
+
+
+def same_channel(name) -> str:
+    """Channels are typed by different people in different systems.
+
+    Marketing writes "Paid Search" in the spend sheet and the CRM says
+    "paid_search". They are the same channel and must not be reported as two.
+    """
+    return " ".join(str(name or "").strip().lower()
+                    .replace("_", " ").replace("-", " ").split())
+
+
+def stage_conversion_and_duration(conn, engagement_id: str, heartbeat):
+    """How far deals get, and how long they sit.
+
+    No stage order is assumed. The client's stages are their own, and a
+    sequence inferred from the data would be a guess presented as structure.
+    What is measured instead needs no order: of the deals that ever entered a
+    stage, how many went on to be won, and how long they stayed.
+
+    Deals that skip stages are counted. A pipeline where half the deals
+    appear first in the final stage is not a pipeline, it is a record kept
+    after the fact, and no conversion rate read from it means anything.
+    """
+    cols = resolve_columns(conn, engagement_id, "stage_conversion_and_duration")
+    needed = ["opportunity_id", "opportunity_status",
+              "stage_history_opportunity_id", "stage_history_to",
+              "stage_entered_at"]
+    absent = [k for k in needed if k not in cols]
+    if absent:
+        raise ValueError("this analysis needs fields that are not mapped: "
+                         + ", ".join(absent))
+
+    # The outcome of each deal, from the deals export.
+    heartbeat(0, 2)
+    outcomes: dict[str, str | None] = {}
+    closed_on: dict[str, object] = {}
+    with storage.download(cols["opportunity_id"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            key = (row.get(cols["opportunity_id"].column_name) or "").strip()
+            if not key:
+                continue
+            outcomes[key] = outcome(row.get(cols["opportunity_status"].column_name))
+            if "opportunity_close_date" in cols:
+                when = a_date(row.get(cols["opportunity_close_date"].column_name))
+                if when:
+                    closed_on[key] = when
+    heartbeat(1, 2)
+
+    # Then the history: every stage each deal entered, and when.
+    history: dict[str, list[tuple[str, object]]] = defaultdict(list)
+    rows = undated = orphan = 0
+    with storage.download(cols["stage_history_to"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            rows += 1
+            deal = (row.get(cols["stage_history_opportunity_id"].column_name) or "").strip()
+            stage = (row.get(cols["stage_history_to"].column_name) or "").strip()
+            when = a_date(row.get(cols["stage_entered_at"].column_name))
+            if not deal or not stage:
+                continue
+            if deal not in outcomes:
+                orphan += 1
+                continue
+            if when is None:
+                undated += 1
+                continue
+            history[deal].append((stage, when))
+    heartbeat(2, 2)
+
+    entered: Counter = Counter()
+    won_after: Counter = Counter()
+    dwell: dict[str, list[int]] = defaultdict(list)
+    transitions: Counter = Counter()
+    first_stage: Counter = Counter()
+
+    for deal, events in history.items():
+        events.sort(key=lambda e: e[1])
+        result = outcomes.get(deal)
+
+        # The last stage a deal reached has nothing after it, so without this
+        # it has no dwell time at all — and time stuck in the final stage is
+        # usually the number worth having. A closed deal's close date ends
+        # its last stage. An open one genuinely has no end yet, and is left
+        # out rather than measured to today, which would grow every time the
+        # analysis ran.
+        if result is not None and deal in closed_on:
+            closing = closed_on[deal]
+            if closing >= events[-1][1]:
+                events.append(("__closed__", closing))
+        seen = set()
+        first_stage[events[0][0]] += 1
+        for i, (stage, when) in enumerate(events):
+            if stage == "__closed__":
+                continue
+            if stage not in seen:
+                seen.add(stage)
+                entered[stage] += 1
+                if result == "won":
+                    won_after[stage] += 1
+            if i + 1 < len(events):
+                nxt = events[i + 1]
+                if nxt[0] != "__closed__":
+                    transitions[(stage, nxt[0])] += 1
+                dwell[stage].append((nxt[1] - when).days)
+
+    def days(values: list[int]) -> dict:
+        if len(values) < MIN_FOR_A_RATE:
+            return {"count": len(values), "suppressed": True}
+        v = sorted(values)
+        def at(q): return v[min(int(q * len(v)), len(v) - 1)]
+        return {"count": len(v), "quickest_tenth": at(0.10),
+                "middle": at(0.50), "slowest_tenth": at(0.90),
+                "suppressed": False}
+
+    stages = []
+    for stage, n in entered.most_common():
+        row = {"stage": stage, "deals_that_entered": n,
+               "went_on_to_be_won": won_after[stage],
+               "days_in_the_stage": days(dwell.get(stage, []))}
+        if n >= MIN_FOR_A_RATE:
+            row["won_after_entering"] = round(won_after[stage] / n, 4)
+        row["suppressed"] = n < MIN_FOR_A_RATE
+        stages.append(row)
+
+    tracked = len(history)
+    return tracked, {
+        "analysis": "stage_conversion_and_duration",
+        "population": {
+            "deals_in_the_export": len(outcomes),
+            "deals_with_a_stage_history": tracked,
+            "history_rows_read": rows,
+            "history_rows_with_no_date": undated,
+            "history_rows_for_a_deal_not_in_the_export": orphan,
+        },
+        "stages": stages,
+        "where_deals_first_appear": [
+            {"stage": s, "count": n, "of": tracked,
+             "share": round(n / tracked, 4) if tracked >= MIN_FOR_A_RATE else None}
+            for s, n in first_stage.most_common()],
+        "most_common_transitions": [
+            {"from": a, "to": b, "count": n}
+            for (a, b), n in transitions.most_common(12)],
+        "rates_suppressed_below": MIN_FOR_A_RATE,
+        "note": "No stage order is assumed. Of the deals that ever entered a "
+                "stage, how many were won and how long they stayed. Where "
+                "deals first appear matters: a pipeline whose deals appear "
+                "first in a late stage is a record kept after the fact.",
+    }
+
+
+def cost_per_qualified_opportunity(conn, engagement_id: str, heartbeat):
+    """What a qualified opportunity costs, by channel.
+
+    Spend and opportunities come from different systems and different
+    people, so the channel names rarely match exactly. They are compared
+    loosely — case, spacing and underscores ignored — and every channel that
+    appears on only one side is reported. A channel with spend and no
+    opportunities is either waste or a naming mismatch, and the client can
+    tell which far faster than we can.
+    """
+    cols = resolve_columns(conn, engagement_id, "cost_per_qualified_opportunity")
+    needed = ["opportunity_id", "channel_source", "qualified_at",
+              "spend_amount", "spend_channel", "spend_month"]
+    absent = [k for k in needed if k not in cols]
+    if absent:
+        raise ValueError("this analysis needs fields that are not mapped: "
+                         + ", ".join(absent))
+
+    heartbeat(0, 2)
+    spend: dict[tuple[str, str], float] = defaultdict(float)
+    spend_rows = spend_undated = spend_unpriced = 0
+    with storage.download(cols["spend_amount"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            spend_rows += 1
+            month = a_month(row.get(cols["spend_month"].column_name))
+            amount = money(row.get(cols["spend_amount"].column_name))
+            channel = same_channel(row.get(cols["spend_channel"].column_name))
+            if month is None:
+                spend_undated += 1
+                continue
+            if amount is None:
+                spend_unpriced += 1
+                continue
+            spend[(channel, month)] += amount
+    heartbeat(1, 2)
+
+    qualified: Counter = Counter()
+    deals = no_qualified_date = no_channel = 0
+    with storage.download(cols["opportunity_id"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            deals += 1
+            month = a_month(row.get(cols["qualified_at"].column_name))
+            if month is None:
+                no_qualified_date += 1
+                continue
+            channel = same_channel(row.get(cols["channel_source"].column_name))
+            if not channel:
+                no_channel += 1
+                continue
+            qualified[(channel, month)] += 1
+    heartbeat(2, 2)
+
+    by_channel: dict[str, dict] = defaultdict(lambda: {"spend": 0.0, "qualified": 0})
+    for (ch, _m), amount in spend.items():
+        by_channel[ch]["spend"] += amount
+    for (ch, _m), n in qualified.items():
+        by_channel[ch]["qualified"] += n
+
+    channels = []
+    for ch, v in sorted(by_channel.items()):
+        row = {"channel": ch or "not recorded",
+               "spend": round(v["spend"], 2),
+               "qualified_opportunities": v["qualified"]}
+        if v["qualified"] >= MIN_FOR_A_RATE and v["spend"] > 0:
+            row["cost_per_qualified_opportunity"] = round(v["spend"] / v["qualified"], 2)
+        else:
+            row["suppressed"] = True
+        channels.append(row)
+
+    spend_only = sorted({c for c, _ in spend} - {c for c, _ in qualified})
+    opps_only = sorted({c for c, _ in qualified} - {c for c, _ in spend})
+
+    total_spend = sum(v["spend"] for v in by_channel.values())
+    total_qualified = sum(v["qualified"] for v in by_channel.values())
+    return total_qualified, {
+        "analysis": "cost_per_qualified_opportunity",
+        "population": {
+            "spend_rows_read": spend_rows,
+            "spend_rows_with_no_month": spend_undated,
+            "spend_rows_with_no_amount": spend_unpriced,
+            "deals_read": deals,
+            "deals_with_no_qualified_date": no_qualified_date,
+            "deals_with_no_channel": no_channel,
+            "qualified_opportunities": total_qualified,
+            "total_spend": round(total_spend, 2),
+        },
+        "overall_cost_per_qualified_opportunity": (
+            round(total_spend / total_qualified, 2)
+            if total_qualified >= MIN_FOR_A_RATE and total_spend > 0 else None),
+        "by_channel": channels,
+        "channels_with_spend_and_no_opportunities": spend_only,
+        "channels_with_opportunities_and_no_spend": opps_only,
+        "rates_suppressed_below": MIN_FOR_A_RATE,
+        "note": "Channel names are compared loosely across the two systems. "
+                "A channel appearing on one side only is either waste or a "
+                "naming mismatch, and the client will know which.",
+    }
+
+
+def forecast_accuracy(conn, engagement_id: str, heartbeat):
+    """Whether the forecast is worth anything.
+
+    Reported signed, not as an absolute error. A team that misses by twenty
+    per cent every quarter in the same direction has a correctable bias; one
+    that misses by twenty either way has no forecast at all, and the two
+    need different conversations.
+    """
+    cols = resolve_columns(conn, engagement_id, "forecast_accuracy")
+    needed = ["forecast_period", "forecast_amount", "forecast_actual_amount"]
+    absent = [k for k in needed if k not in cols]
+    if absent:
+        raise ValueError("this analysis needs fields that are not mapped: "
+                         + ", ".join(absent))
+
+    periods: dict[str, dict] = {}
+    rows = unusable = 0
+    with storage.download(cols["forecast_amount"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            rows += 1
+            period = (row.get(cols["forecast_period"].column_name) or "").strip()
+            forecast = money(row.get(cols["forecast_amount"].column_name))
+            actual = money(row.get(cols["forecast_actual_amount"].column_name))
+            if not period or forecast is None or actual is None or forecast <= 0:
+                unusable += 1
+                continue
+            p = periods.setdefault(period, {"forecast": 0.0, "actual": 0.0,
+                                            "submissions": 0})
+            p["forecast"] += forecast
+            p["actual"] += actual
+            p["submissions"] += 1
+    heartbeat(1, 1)
+
+    out_periods, errors = [], []
+    for period, p in sorted(periods.items()):
+        err = (p["actual"] - p["forecast"]) / p["forecast"]
+        errors.append(err)
+        out_periods.append({
+            "period": period, "forecast": round(p["forecast"], 2),
+            "actual": round(p["actual"], 2),
+            "submissions": p["submissions"],
+            "error": round(err, 4),
+            "direction": "over-forecast" if err < 0 else "under-forecast",
+        })
+
+    n = len(errors)
+    bias = round(sum(errors) / n, 4) if n else None
+    spread = round(sum(abs(e) for e in errors) / n, 4) if n else None
+    return n, {
+        "analysis": "forecast_accuracy",
+        "population": {
+            "rows_read": rows,
+            "rows_with_no_period_or_no_figures": unusable,
+            "periods": n,
+        },
+        "periods": out_periods,
+        "average_error": bias,
+        "average_miss_whichever_way": spread,
+        "always_the_same_way": (n >= 3 and all(e < 0 for e in errors))
+                               or (n >= 3 and all(e > 0 for e in errors)),
+        "periods_too_few_to_judge": n < 3,
+        "note": "Error is actual minus forecast over forecast, per period. "
+                "A consistent direction is a correctable bias. A miss that "
+                "goes either way is not a forecast.",
+    }
+
+
 # The analyses that read real data. Everything not here is still a fixture,
 # and the database refuses to accept a fixture as evidence.
 BUILT = {
     "icp_reconciliation": icp_reconciliation,
     "win_loss_and_churn_patterns": win_loss_and_churn_patterns,
     "price_discount_dispersion": price_discount_dispersion,
+    "stage_conversion_and_duration": stage_conversion_and_duration,
+    "cost_per_qualified_opportunity": cost_per_qualified_opportunity,
+    "forecast_accuracy": forecast_accuracy,
 }
