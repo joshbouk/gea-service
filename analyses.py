@@ -111,21 +111,57 @@ REVENUE_BANDS = [(1_000_000, "under 1M"), (10_000_000, "1M to 10M"),
                  (10 ** 15, "250M and above")]
 
 
+# Values that occupy the field without answering it. A loss reason of
+# "Other" does not say why the deal was lost; it says the person closing it
+# had somewhere to click that was not a reason. Counting these as the leading
+# answer turns a tracking failure into a finding about the market, which is
+# the opposite of true.
+NON_ANSWERS = {
+    "other", "others", "n/a", "na", "none", "no reason", "not applicable",
+    "unknown", "unspecified", "not specified", "not set", "tbd",
+    "to be determined", "misc", "miscellaneous", "default", "-", "--",
+    "blank", "null", "nil", "no", "n a", "not recorded", "not stated",
+    "undefined", "general", "no answer",
+}
+
+
+def is_a_non_answer(value: str) -> bool:
+    return str(value).strip().lower().strip(".") in NON_ANSWERS
+
+
 @dataclass
 class Cut:
-    """One dimension of the picture, and the records behind it."""
+    """One dimension of the picture, and the records behind it.
+
+    Three buckets, never two. A record can carry a real value, carry a value
+    that is not an answer, or carry nothing. Collapsing the last two loses
+    the difference between a field nobody fills in and a field everyone fills
+    in with "Other" — and the second is the worse finding, because it looks
+    like compliance.
+    """
     name: str
     counts: Counter = field(default_factory=Counter)
+    non_answers: Counter = field(default_factory=Counter)
     missing: int = 0
 
     def add(self, value: str | None) -> None:
         if value is None or str(value).strip() == "":
             self.missing += 1
+        elif is_a_non_answer(value):
+            self.non_answers[str(value).strip()] += 1
         else:
             self.counts[str(value).strip()] += 1
 
+    @property
+    def answered(self) -> int:
+        return sum(self.counts.values())
+
+    @property
+    def not_answered(self) -> int:
+        return sum(self.non_answers.values()) + self.missing
+
     def as_dict(self, total: int) -> dict:
-        known = sum(self.counts.values())
+        known = self.answered
         rows = []
         for value, n in self.counts.most_common():
             row = {"value": value, "count": n, "of": known}
@@ -133,14 +169,100 @@ class Cut:
             if known >= MIN_FOR_A_RATE:
                 row["share"] = round(n / known, 4)
             rows.append(row)
+        held = sum(self.non_answers.values())
         return {
             "dimension": self.name,
-            "records_with_a_value": known,
-            "records_without_one": self.missing,
+            "records_with_an_answer": known,
+            "records_with_a_non_answer": held,
+            "records_with_nothing": self.missing,
             "of": total,
+            # What a consultant needs first: how much of this field is unusable.
+            "unusable_share": (round((held + self.missing) / total, 4)
+                               if total >= MIN_FOR_A_RATE else None),
+            "non_answers_used": [{"value": v, "count": n}
+                                 for v, n in self.non_answers.most_common()],
             "suppressed": known < MIN_FOR_A_RATE,
             "values": rows,
         }
+
+
+def load_accounts(cols: dict[str, Column]) -> dict[str, dict]:
+    """A lookup from account to its firmographics, from the companies export.
+
+    Held in memory because it is one row per customer, not one per deal: a
+    client with twenty thousand accounts is a few megabytes. The deals file,
+    which is the big one, is never held.
+    """
+    out: dict[str, dict] = {}
+    if "account_id" not in cols:
+        return out
+    with storage.download(cols["account_id"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            key = (row.get(cols["account_id"].column_name) or "").strip()
+            if not key:
+                continue
+            out[key] = {
+                name: row.get(cols[field].column_name)
+                for name, field in (("industry", "account_industry"),
+                                    ("country", "account_country"),
+                                    ("employees", "account_employee_count"),
+                                    ("revenue", "account_annual_revenue"),
+                                    ("segment", "account_segment"))
+                if field in cols
+            }
+    return out
+
+
+def firmographic_cuts(cols: dict[str, Column]) -> tuple[dict[str, Cut], list[str]]:
+    """The dimensions a firmographic picture is cut by, and those not mapped."""
+    dims = [("industry", "account_industry"), ("country", "account_country"),
+            ("employee band", "account_employee_count"),
+            ("revenue band", "account_annual_revenue"),
+            ("segment", "account_segment")]
+    return ({n: Cut(n) for n, k in dims if k in cols},
+            [n for n, k in dims if k not in cols])
+
+
+def add_firmographics(cuts: dict[str, Cut], acct: dict) -> None:
+    if "industry" in cuts:
+        cuts["industry"].add(acct.get("industry"))
+    if "country" in cuts:
+        cuts["country"].add(acct.get("country"))
+    if "employee band" in cuts:
+        cuts["employee band"].add(_band(acct.get("employees"), EMPLOYEE_BANDS))
+    if "revenue band" in cuts:
+        cuts["revenue band"].add(_band(acct.get("revenue"), REVENUE_BANDS))
+    if "segment" in cuts:
+        cuts["segment"].add(acct.get("segment"))
+
+
+def money(value) -> float | None:
+    """A number, or None. An unparseable figure is not a zero."""
+    if value is None:
+        return None
+    t = str(value).strip().replace(",", "").replace("$", "").replace("£", "")
+    t = t.replace("€", "")
+    if t in ("", "-"):
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+WON = ("won", "closed won", "closedwon", "closed-won")
+LOST = ("lost", "closed lost", "closedlost", "closed-lost", "closed/lost")
+
+
+def outcome(value) -> str | None:
+    """Won, lost, or neither. Neither is open, and open is not a loss."""
+    t = (str(value) if value is not None else "").strip().lower()
+    if t in WON:
+        return "won"
+    if t in LOST:
+        return "lost"
+    return None
 
 
 def icp_reconciliation(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
@@ -169,38 +291,15 @@ def icp_reconciliation(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
 
     # The companies file first: a lookup from account to its firmographics.
     heartbeat(0, 2)
-    accounts: dict[str, dict] = {}
-    with storage.download(accounts_path).open("r", encoding="utf-8-sig",
-                                              newline="") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            key = (row.get(cols["account_id"].column_name) or "").strip()
-            if not key:
-                continue
-            accounts[key] = {
-                "industry": row.get(cols["account_industry"].column_name),
-                "country": row.get(cols["account_country"].column_name),
-                "employees": row.get(cols["account_employee_count"].column_name),
-                "revenue": row.get(cols["account_annual_revenue"].column_name),
-                "segment": (row.get(cols["account_segment"].column_name)
-                            if "account_segment" in cols else None),
-            }
+    accounts = load_accounts(cols)
     heartbeat(1, 2)
 
     # Then the deals, one at a time. The file is never held in memory.
-    won = ("won", "closed won", "closedwon", "closed-won")
-
     # Only cut by a dimension whose field is actually mapped. A cut reading
     # "0 with a value, 362 without" on an unmapped field says the client
     # leaves it blank, when the truth is that nobody looked. Those are
     # different findings and must not look alike.
-    dimensions = [("industry", "account_industry"),
-                  ("country", "account_country"),
-                  ("employee band", "account_employee_count"),
-                  ("revenue band", "account_annual_revenue"),
-                  ("segment", "account_segment")]
-    cuts = {name: Cut(name) for name, key in dimensions if key in cols}
-    not_cut = [name for name, key in dimensions if key not in cols]
+    cuts, not_cut = firmographic_cuts(cols)
     deals = won_deals = no_account = unmatched = 0
 
     status_col = cols["opportunity_status"].column_name
@@ -210,7 +309,7 @@ def icp_reconciliation(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
                                            newline="") as fh:
         for row in csv.DictReader(fh):
             deals += 1
-            if (row.get(status_col) or "").strip().lower() not in won:
+            if outcome(row.get(status_col)) != "won":
                 continue
             won_deals += 1
 
@@ -223,16 +322,7 @@ def icp_reconciliation(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
                 unmatched += 1
                 continue
 
-            if "industry" in cuts:
-                cuts["industry"].add(acct["industry"])
-            if "country" in cuts:
-                cuts["country"].add(acct["country"])
-            if "employee band" in cuts:
-                cuts["employee band"].add(_band(acct["employees"], EMPLOYEE_BANDS))
-            if "revenue band" in cuts:
-                cuts["revenue band"].add(_band(acct["revenue"], REVENUE_BANDS))
-            if "segment" in cuts:
-                cuts["segment"].add(acct["segment"])
+            add_firmographics(cuts, acct)
     heartbeat(2, 2)
 
     described = won_deals - no_account - unmatched
@@ -267,8 +357,240 @@ def icp_reconciliation(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
     }
 
 
+def win_loss_and_churn_patterns(conn, engagement_id: str, heartbeat):
+    """Who actually wins, who actually churns, and whether those agree.
+
+    The win rate is won over won plus lost. Open deals are excluded and
+    counted, because an open deal is not a loss and treating it as one
+    flatters nobody.
+
+    The loss reason distribution carries the share held by its single most
+    common value, and nothing more. A reason holding most of the records is
+    usually a default nobody changed rather than a pattern, and deciding
+    which is a judgement about how the client's team works — not something
+    this can tell from the values.
+    """
+    cols = resolve_columns(conn, engagement_id, "win_loss_and_churn_patterns")
+    needed = ["opportunity_id", "opportunity_status", "opportunity_account_id",
+              "loss_reason", "account_id", "account_industry",
+              "account_employee_count"]
+    absent = [k for k in needed if k not in cols]
+    if absent:
+        raise ValueError("this analysis needs fields that are not mapped: "
+                         + ", ".join(absent))
+
+    heartbeat(0, 2)
+    accounts = load_accounts(cols)
+    heartbeat(1, 2)
+
+    won_cuts, not_cut = firmographic_cuts(cols)
+    lost_cuts, _ = firmographic_cuts(cols)
+    loss_reasons, win_reasons, competitors = Cut("loss reason"), Cut("win reason"), Cut("competitor named")
+
+    deals = won = lost = open_deals = no_account = unmatched = 0
+    status_col = cols["opportunity_status"].column_name
+    account_col = cols["opportunity_account_id"].column_name
+
+    with storage.download(cols["opportunity_status"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            deals += 1
+            result = outcome(row.get(status_col))
+            if result is None:
+                open_deals += 1
+                continue
+            if result == "won":
+                won += 1
+                if "win_reason" in cols:
+                    win_reasons.add(row.get(cols["win_reason"].column_name))
+            else:
+                lost += 1
+                loss_reasons.add(row.get(cols["loss_reason"].column_name))
+                if "competitor_named" in cols:
+                    competitors.add(row.get(cols["competitor_named"].column_name))
+
+            key = (row.get(account_col) or "").strip()
+            if not key:
+                no_account += 1
+                continue
+            acct = accounts.get(key)
+            if acct is None:
+                unmatched += 1
+                continue
+            add_firmographics(won_cuts if result == "won" else lost_cuts, acct)
+    heartbeat(2, 2)
+
+    decided = won + lost
+    overall = round(won / decided, 4) if decided >= MIN_FOR_A_RATE else None
+
+    # Where the win rate differs most from the overall rate. Reported with
+    # both counts, because a cut of twelve records swinging twenty points is
+    # arithmetic, not a finding.
+    variance = []
+    for name, cut in won_cuts.items():
+        for value, n_won in cut.counts.items():
+            n_lost = lost_cuts[name].counts.get(value, 0)
+            total = n_won + n_lost
+            if total < MIN_FOR_A_RATE:
+                continue
+            rate = n_won / total
+            variance.append({
+                "dimension": name, "value": value,
+                "won": n_won, "lost": n_lost, "of": total,
+                "win_rate": round(rate, 4),
+                "points_from_overall": (round((rate - overall) * 100, 1)
+                                        if overall is not None else None),
+            })
+    variance.sort(key=lambda v: abs(v["points_from_overall"] or 0), reverse=True)
+
+    reasons = loss_reasons.as_dict(lost)
+    out = {
+        "analysis": "win_loss_and_churn_patterns",
+        "population": {
+            "deals_read": deals, "won": won, "lost": lost,
+            "decided": decided, "still_open": open_deals,
+            "described": decided - no_account - unmatched,
+        },
+        "win_rate": overall,
+        "win_rate_of": decided,
+        "widest_variance": variance[:3],
+        "loss_reasons": reasons,
+        # The first number a consultant needs. A client whose loss reasons are
+        # two thirds "Other" has no loss reason data, whatever the field says,
+        # and no pattern read from the remaining third is safe to generalise.
+        "losses_with_no_usable_reason": loss_reasons.not_answered,
+        "losses_with_no_usable_reason_share": (
+            round(loss_reasons.not_answered / lost, 4)
+            if lost >= MIN_FOR_A_RATE else None),
+        "won_by": [c.as_dict(won) for c in won_cuts.values()],
+        "lost_by": [c.as_dict(lost) for c in lost_cuts.values()],
+        "not_cut_because_the_field_is_not_mapped": not_cut,
+        "gaps": [g.as_dict() for g in (
+            [Gap("decided deals with no account on the record", no_account, decided)] if no_account else [])
+            + ([Gap("decided deals whose account is not in the companies export",
+                    unmatched, decided)] if unmatched else [])],
+        "rates_suppressed_below": MIN_FOR_A_RATE,
+        "note": "Values like Other and N/A are counted as no reason given, "
+                "not as a reason. Where most losses carry one, the client "
+                "does not record why deals are lost, and the pattern in the "
+                "remainder describes only the minority who filled it in.",
+    }
+    if "win_reason" in cols:
+        out["win_reasons"] = win_reasons.as_dict(won)
+    if "competitor_named" in cols:
+        out["competitors"] = competitors.as_dict(lost)
+    return decided, out
+
+
+def price_discount_dispersion(conn, engagement_id: str, heartbeat):
+    """What the client actually charges, against what they say they charge.
+
+    Discount is list minus realised, over list, per closed-won deal. Only
+    where both are present and list is above zero: a deal with no list price
+    has no discount, and calling that nought per cent would report
+    discipline the client has not got.
+
+    A realised price above list is kept as an uplift rather than clamped to
+    nought. It is rare, it is real, and hiding it would make the spread look
+    tidier than it is.
+    """
+    cols = resolve_columns(conn, engagement_id, "price_discount_dispersion")
+    needed = ["opportunity_id", "opportunity_status", "opportunity_list_price",
+              "opportunity_realised_price"]
+    absent = [k for k in needed if k not in cols]
+    if absent:
+        raise ValueError("this analysis needs fields that are not mapped: "
+                         + ", ".join(absent))
+
+    accounts = load_accounts(cols) if "account_id" in cols else {}
+    discounts: list[float] = []
+    same_as_list = 0
+    by_segment: dict[str, list[float]] = defaultdict(list)
+    by_owner: dict[str, list[float]] = defaultdict(list)
+    won = no_list = no_realised = zero_list = 0
+
+    status_col = cols["opportunity_status"].column_name
+    list_col = cols["opportunity_list_price"].column_name
+    real_col = cols["opportunity_realised_price"].column_name
+
+    with storage.download(cols["opportunity_status"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            if outcome(row.get(status_col)) != "won":
+                continue
+            won += 1
+            lst, real = money(row.get(list_col)), money(row.get(real_col))
+            if lst is None:
+                no_list += 1
+                continue
+            if real is None:
+                no_realised += 1
+                continue
+            if lst <= 0:
+                zero_list += 1
+                continue
+            if lst == real:
+                same_as_list += 1
+            d = (lst - real) / lst
+            discounts.append(d)
+            if "opportunity_owner" in cols:
+                by_owner[(row.get(cols["opportunity_owner"].column_name)
+                          or "not recorded").strip()].append(d)
+            if accounts and "account_segment" in cols:
+                acct = accounts.get((row.get(cols["opportunity_account_id"].column_name) or "").strip())
+                if acct:
+                    by_segment[(acct.get("segment") or "not recorded")].append(d)
+    heartbeat(1, 1)
+
+    def spread(values: list[float]) -> dict | None:
+        if len(values) < MIN_FOR_A_RATE:
+            return {"count": len(values), "suppressed": True}
+        v = sorted(values)
+        def at(q): return round(v[min(int(q * len(v)), len(v) - 1)], 4)
+        return {
+            "count": len(v),
+            "no_discount": round(sum(1 for x in v if x <= 0) / len(v), 4),
+            "lowest_tenth": at(0.10), "lower_quarter": at(0.25),
+            "middle": at(0.50), "upper_quarter": at(0.75),
+            "highest_tenth": at(0.90),
+            "suppressed": False,
+        }
+
+    return won, {
+        "analysis": "price_discount_dispersion",
+        "population": {
+            "closed_won": won, "priced": len(discounts),
+            "no_list_price": no_list, "no_realised_price": no_realised,
+            "list_price_of_zero_or_less": zero_list,
+            "realised_equals_list": same_as_list,
+        },
+        # A client who prices every deal on its merits has no list price to
+        # discount from. Reporting that as nought per cent discount would
+        # describe pricing discipline they have not got, and it is the
+        # commonest shape in the mid-market: custom pricing per deal, no
+        # packaging to hold the line.
+        "no_list_price_structure": (
+            len(discounts) >= MIN_FOR_A_RATE
+            and (same_as_list / len(discounts)) >= 0.95),
+        "discount": spread(discounts),
+        "by_segment": ({k: spread(v) for k, v in sorted(by_segment.items())}
+                       if by_segment else None),
+        "by_owner": ({k: spread(v) for k, v in sorted(by_owner.items())}
+                     if by_owner else None),
+        "rates_suppressed_below": MIN_FOR_A_RATE,
+        "note": "Discount is list minus realised over list, on closed-won "
+                "deals where both are recorded. Deals with no list price are "
+                "counted, not treated as full price. Where the realised price "
+                "equals the list price on nearly every deal, the client does "
+                "not operate a list price, and that is a finding about "
+                "packaging rather than a record of perfect discipline.",
+    }
+
+
 # The analyses that read real data. Everything not here is still a fixture,
 # and the database refuses to accept a fixture as evidence.
 BUILT = {
     "icp_reconciliation": icp_reconciliation,
+    "win_loss_and_churn_patterns": win_loss_and_churn_patterns,
+    "price_discount_dispersion": price_discount_dispersion,
 }
