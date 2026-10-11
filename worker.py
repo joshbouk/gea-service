@@ -53,6 +53,11 @@ POLL_SECONDS = 2.0
 # working.
 STORAGE_ATTEMPTS = 3
 STORAGE_BACKOFF = (2, 8)
+
+# The connection will die: laptops sleep, networks drop, databases restart.
+# The worker waits and reconnects rather than stopping, backing off so a
+# database that is genuinely down is not hammered.
+RECONNECT_MAX = 30
 running = True
 
 
@@ -263,6 +268,27 @@ def work_one(conn: psycopg.Connection) -> bool:
     return True
 
 
+def connect(dsn: str, quiet: bool = False):
+    """Open a connection, waiting for the database if it is not there yet.
+
+    Returns None when asked to stop while waiting.
+    """
+    delay = 1
+    while running:
+        try:
+            conn = psycopg.connect(dsn)
+            if not quiet:
+                log("connected")
+            return conn
+        except psycopg.OperationalError as exc:
+            if not quiet:
+                log(f"database not reachable ({str(exc).splitlines()[0]}); "
+                    f"trying again in {delay}s")
+            time.sleep(delay)
+            delay = min(delay * 2, RECONNECT_MAX)
+    return None
+
+
 def main() -> int:
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
@@ -270,34 +296,67 @@ def main() -> int:
               "file.", file=sys.stderr)
         return 1
 
-    try:
-        conn = psycopg.connect(dsn)
-    except Exception as exc:                                   # noqa: BLE001
-        print(f"Could not reach the database. {exc}", file=sys.stderr)
-        return 1
-
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    log("stub analysis service started. Ctrl-C to stop.")
 
+    try:
+        first = psycopg.connect(dsn)
+    except psycopg.OperationalError as exc:
+        # Refuse to start against a database that is not there. A worker that
+        # silently retries forever on a typo in DATABASE_URL looks identical
+        # to one with no work to do.
+        print(f"Could not reach the database. {exc}", file=sys.stderr)
+        return 1
+    conn = first
+
+    log("analysis service started. Ctrl-C to stop.")
     idle_reported = False
-    with conn:
-        while running:
-            try:
-                did_work = work_one(conn)
-            except Exception as exc:                           # noqa: BLE001
-                log(f"error: {exc}")
-                conn.rollback()
-                time.sleep(POLL_SECONDS)
-                continue
 
-            if did_work:
-                idle_reported = False
-            else:
-                if not idle_reported:
-                    log("queue empty, waiting")
-                    idle_reported = True
-                time.sleep(POLL_SECONDS)
+    while running:
+        try:
+            did_work = work_one(conn)
+
+        except psycopg.OperationalError as exc:
+            # The connection died: the machine slept, the network dropped, the
+            # database restarted. None of that is a reason to stop. Replace the
+            # connection and carry on. Nothing is lost — a run claimed on a
+            # connection that died was never committed as claimed, so it is
+            # still queued for whoever picks it up next.
+            log(f"lost the connection ({str(exc).splitlines()[0]})")
+            try:
+                conn.close()
+            except Exception:                                  # noqa: BLE001
+                pass
+            conn = connect(dsn)
+            if conn is None:
+                break
+            idle_reported = False
+            continue
+
+        except Exception as exc:                               # noqa: BLE001
+            log(f"error: {exc}")
+            try:
+                conn.rollback()
+            except psycopg.Error:
+                # Rolling back on a broken connection throws again. Let the
+                # next pass through the loop deal with it rather than dying
+                # inside the handler, which is what used to kill the process.
+                pass
+            time.sleep(POLL_SECONDS)
+            continue
+
+        if did_work:
+            idle_reported = False
+        else:
+            if not idle_reported:
+                log("queue empty, waiting")
+                idle_reported = True
+            time.sleep(POLL_SECONDS)
+
+    try:
+        conn.close()
+    except Exception:                                          # noqa: BLE001
+        pass
 
     log("stopped")
     return 0
