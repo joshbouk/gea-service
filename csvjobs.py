@@ -127,6 +127,11 @@ class ColumnStats:
     # such rather than as a precise figure.
     CAP = 50_000
 
+    # How many real values to keep for someone deciding what this column is.
+    # Distinct, so a column that reads "Closed Won" nine times out of ten
+    # shows what else it can be rather than the same word repeated.
+    SAMPLES = 10
+
     def observe(self, value: str) -> None:
         value = value.strip()
         if value == "":
@@ -300,4 +305,7 @@ def profile_column(c: ColumnStats, rows: int) -> dict:
         "top_value_share": (round(top_share, 6) if top_share is not None else None),
         "is_free_text": is_free_text,
         "flags": flags,
+        # Longest-first would surface the outliers; most common first shows
+        # what the column usually holds, which is what identifies it.
+        "sample_values": [v for v, _ in c.distinct.most_common(ColumnStats.SAMPLES)],
     }

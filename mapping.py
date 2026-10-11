@@ -31,9 +31,16 @@ from difflib import SequenceMatcher
 NOISE = {"the", "of", "a", "field", "value", "custom", "property",
          "hs", "sf", "c", "x"}
 
-# Confidence bands. Nothing below medium is offered at all: a weak suggestion
-# costs more attention than no suggestion, and teaches people to skim.
+# Confidence bands. Nothing below medium is offered as a proposal: a weak
+# suggestion costs more attention than no suggestion, and teaches people to
+# skim.
 HIGH, MEDIUM, MEDIUM_LOW, FLOOR = 0.92, 0.75, 0.55, 0.75
+
+# Near-misses are still kept, as candidates rather than answers. A column that
+# scores 0.69 is not good enough to suggest and is far too useful to discard:
+# when someone goes looking, it belongs at the top of the list rather than
+# buried among five hundred others. Nothing here is ever pre-selected.
+RESEARCH_FLOOR = 0.40
 
 
 def normalise(name: str) -> str:
@@ -57,10 +64,17 @@ def stem(word: str) -> str:
     for suffix in ("ies", "ied"):
         if len(word) > 4 and word.endswith(suffix):
             return word[:-3] + "y"
-    for suffix in ("ing", "ed", "es", "s", "d"):
-        if len(word) > 3 and word.endswith(suffix):
+    if word.endswith("ss"):
+        return word          # loss, address, process: the s is part of the word
+    for suffix in ("ing", "ed", "es"):
+        if len(word) > 5 and word.endswith(suffix):
             return word[: -len(suffix)]
-    return word
+    for suffix in ("s", "d"):
+        if len(word) > 4 and word.endswith(suffix):
+            word = word[: -len(suffix)]
+            break
+    # create and created both land on creat only if the trailing e goes too.
+    return word[:-1] if len(word) > 4 and word.endswith("e") else word
 
 
 def tokens(name: str) -> set[str]:
@@ -247,16 +261,25 @@ def propose(canonical_key: str, description: str | None,
 
     scored.sort(key=lambda s: (-s[0], s[1].name))
     viable = [s for s in scored if s[0] >= FLOOR]
+    research = [s for s in scored if s[0] >= RESEARCH_FLOOR]
+
+    def candidates(exclude: str | None) -> list[dict]:
+        return [{"field_name": c.name,
+                 "confidence": band(sc),
+                 "populated_rate": round(c.populated_rate, 4),
+                 "inferred_type": c.inferred_type}
+                for sc, c, _ in research if c.name != exclude][:5]
 
     if not viable:
         return Proposal(
             canonical_field_id, canonical_key, None, None, None,
+            alternatives=candidates(None),
             evidence_note=(
                 f"No column in the {', '.join(sorted({c.export_ref for c in columns})) or 'uploaded'} "
                 f"export looks like {canonical_key}."
                 if columns else
                 f"The export {canonical_key} comes from has not been uploaded yet."),
-            alternatives=[], is_cap_bearing=is_cap_bearing)
+            is_cap_bearing=is_cap_bearing)
 
     best_score, best, (good, bad) = viable[0]
     if normalise(canonical_key) == normalise(best.name):
@@ -274,9 +297,5 @@ def propose(canonical_key: str, description: str | None,
         band(best_score), note,
         proposed_is_empty=best.populated_count == 0,
         proposed_is_exact=is_exact(canonical_key, best.name),
-        alternatives=[{"field_name": c.name,
-                       "confidence": band(s),
-                       "populated_rate": round(c.populated_rate, 4),
-                       "inferred_type": c.inferred_type}
-                      for s, c, _ in viable[1:4]],
+        alternatives=candidates(best.name),
         is_cap_bearing=is_cap_bearing)

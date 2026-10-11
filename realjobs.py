@@ -13,7 +13,7 @@ from pathlib import Path
 import csvjobs
 import storage
 
-VERSION = "parse-1"
+VERSION = "parse-2"
 
 
 def parse_export(conn, run_id: str, engagement_id: str, artefact_ids: list[str],
@@ -79,12 +79,14 @@ def parse_export(conn, run_id: str, engagement_id: str, artefact_ids: list[str],
         cur.executemany(
             """insert into dataset_field_profile (dataset_id, field_name,
                    inferred_type, populated_count, populated_rate,
-                   distinct_count, top_value, top_value_share, is_free_text, flags)
-               values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                   distinct_count, top_value, top_value_share, is_free_text,
+                   flags, sample_values)
+               values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             [(dataset_id, p["field_name"], p["inferred_type"],
               p["populated_count"], p["populated_rate"], p["distinct_count"],
               p["top_value"], p["top_value_share"], p["is_free_text"],
-              p["flags"]) for p in profiles])
+              p["flags"], [v[:200] for v in p["sample_values"]])
+             for p in profiles])
 
         cur.execute(
             "update artefact set row_count = %s, column_count = %s where id = %s",
