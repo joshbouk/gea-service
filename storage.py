@@ -24,14 +24,25 @@ class StorageError(RuntimeError):
     """Reaching the file failed. The run fails and says so."""
 
 
+class NotConfigured(StorageError):
+    """A credential is missing. Not transient: retrying cannot help."""
+
+
 def _config() -> tuple[str, str]:
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SERVICE_KEY")
     if not url or not key:
-        raise StorageError(
-            "SUPABASE_URL and SUPABASE_SERVICE_KEY must be set to read client "
-            "exports. See the comment at the top of worker.py.")
+        missing = ", ".join(n for n, v in (("SUPABASE_URL", url),
+                                           ("SUPABASE_SERVICE_KEY", key)) if not v)
+        raise NotConfigured(
+            f"{missing} is not set, so client exports cannot be read. See the "
+            f"comment at the top of worker.py.")
     return url.rstrip("/"), key
+
+
+def check_configured() -> None:
+    """Called at startup. Raises NotConfigured if a credential is missing."""
+    _config()
 
 
 def download(storage_path: str, on_progress=None) -> Path:

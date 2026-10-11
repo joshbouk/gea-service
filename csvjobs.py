@@ -29,10 +29,30 @@ from __future__ import annotations
 import csv
 import io
 import re
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
+
+# csv refuses a field over 128 KB by default. A CRM export blows through that
+# routinely: a column of associated records concatenates every one of them into
+# a single cell, and a notes column can hold a whole conversation. Raise it as
+# far as this build allows, then cap it somewhere a genuinely corrupt file
+# still fails rather than eating memory.
+MAX_FIELD_BYTES = 64 * 1024 * 1024
+
+_limit = MAX_FIELD_BYTES
+while True:
+    try:
+        csv.field_size_limit(_limit)
+        break
+    except OverflowError:
+        # On some builds this is a C long and smaller than it looks. Step
+        # down until it is accepted.
+        _limit //= 2
+MAX_FIELD_BYTES = _limit
+
 
 # A column is treated as free text when its values are long and mostly
 # distinct. The thresholds are deliberately conservative: calling a picklist
@@ -214,7 +234,21 @@ def read_export(path: Path, on_progress=None) -> ParseResult:
         columns = [ColumnStats(n) for n in names]
         width = len(names)
 
-        for row in reader:
+        while True:
+            try:
+                row = next(reader)
+            except StopIteration:
+                break
+            except csv.Error as exc:
+                # A field longer than the cap, or a quote that never closes.
+                # Either way the file cannot be read past this point, and
+                # saying where is more use than the library's own wording.
+                raise ParseError(
+                    f"the file could not be read past line {reader.line_num:,}: "
+                    f"{exc}. A single value longer than "
+                    f"{MAX_FIELD_BYTES // (1024 * 1024)} MB, or a quotation "
+                    f"mark that is never closed, will do this."
+                ) from None
             rows += 1
             if len(row) != width:
                 malformed += 1

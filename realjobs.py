@@ -14,7 +14,7 @@ from pathlib import Path
 import csvjobs
 import storage
 
-VERSION = "parse-2"
+VERSION = "parse-3"
 
 
 def parse_export(conn, run_id: str, engagement_id: str, artefact_ids: list[str],
