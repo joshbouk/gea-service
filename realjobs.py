@@ -8,6 +8,7 @@ client's data or from a placeholder.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import csvjobs
@@ -59,14 +60,29 @@ def parse_export(conn, run_id: str, engagement_id: str, artefact_ids: list[str],
     profiles = [csvjobs.profile_column(c, result.row_count) for c in result.columns]
 
     with conn.cursor() as cur:
-        # Re-parsing the same bytes gives the same answer, so replacing the
-        # previous description is safe. The artefact itself is immutable.
-        cur.execute("delete from dataset where artefact_id = %s", (artefact_id,))
+        # The dataset row is updated rather than replaced. Field mappings point
+        # at it, so deleting it is refused once anyone has mapped a column —
+        # which made re-reading a file impossible exactly when it mattered
+        # most, after the mapping work had been done.
+        #
+        # Re-parsing the same bytes gives the same answer, so the row keeps its
+        # identity and its description is rewritten. The field profiles under
+        # it are replaced outright.
         cur.execute(
             """insert into dataset (artefact_id, row_count, column_count,
                    primary_date_field, date_min, date_max, malformed_rows,
                    parse_status, parse_errors)
-               values (%s,%s,%s,%s,%s,%s,%s,'parsed',%s) returning id""",
+               values (%s,%s,%s,%s,%s,%s,%s,'parsed',%s)
+               on conflict (artefact_id) do update
+                  set row_count = excluded.row_count,
+                      column_count = excluded.column_count,
+                      primary_date_field = excluded.primary_date_field,
+                      date_min = excluded.date_min,
+                      date_max = excluded.date_max,
+                      malformed_rows = excluded.malformed_rows,
+                      parse_status = excluded.parse_status,
+                      parse_errors = excluded.parse_errors
+               returning id""",
             (artefact_id, result.row_count, result.column_count,
              result.primary_date_field, result.date_min, result.date_max,
              result.malformed_rows,
@@ -75,6 +91,9 @@ def parse_export(conn, run_id: str, engagement_id: str, artefact_ids: list[str],
                          "malformed_examples": result.malformed_examples})
              if result.malformed_rows else None))
         dataset_id = cur.fetchone()[0]
+
+        cur.execute("delete from dataset_field_profile where dataset_id = %s",
+                    (dataset_id,))
 
         cur.executemany(
             """insert into dataset_field_profile (dataset_id, field_name,
@@ -91,6 +110,25 @@ def parse_export(conn, run_id: str, engagement_id: str, artefact_ids: list[str],
         cur.execute(
             "update artefact set row_count = %s, column_count = %s where id = %s",
             (result.row_count, result.column_count, artefact_id))
+    conn.commit()
+
+    # Reading a file is only ever the first half. Uploading is the decision a
+    # person makes; proposing the mappings is the consequence, and it should
+    # not depend on anyone remembering to ask for it.
+    #
+    # Queued here rather than by a database trigger because only this code
+    # knows a read has just finished. A trigger would have to infer it from
+    # the row, and a re-read of the same file leaves the row looking identical.
+    with conn.cursor() as cur:
+        cur.execute(
+            """select run_id, was_created from gea_enqueue_run(
+                   %s, 'propose_mappings', null, null, null, null, %s::jsonb)""",
+            (engagement_id, json.dumps({
+                "after_dataset": str(dataset_id),
+                # Microseconds, because two readings a second apart are still
+                # two readings and each deserves its own proposal run.
+                "read_at": datetime.now(timezone.utc).isoformat(),
+            })))
     conn.commit()
 
     flagged = sum(1 for p in profiles if p["flags"])
@@ -118,11 +156,16 @@ def record_parse_failure(conn, artefact_id: str, reason: str) -> None:
     and the difference is what a consultant needs to tell the client.
     """
     with conn.cursor() as cur:
-        cur.execute("delete from dataset where artefact_id = %s", (artefact_id,))
         cur.execute(
             """insert into dataset (artefact_id, parse_status, parse_errors)
-               values (%s, 'failed', %s)""",
+               values (%s, 'failed', %s)
+               on conflict (artefact_id) do update
+                  set parse_status = 'failed',
+                      parse_errors = excluded.parse_errors""",
             (artefact_id, json.dumps({"reason": reason})))
+        cur.execute("""delete from dataset_field_profile where dataset_id =
+                       (select id from dataset where artefact_id = %s)""",
+                    (artefact_id,))
     conn.commit()
 
 

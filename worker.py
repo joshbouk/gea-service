@@ -147,17 +147,25 @@ def parse_with_retries(conn, run_id, engagement_id, artefact_ids, heartbeat):
     raise AssertionError("unreachable")
 
 
+# Set by work_one so the loop can fail the run if something unexpected goes
+# wrong inside it.
+claimed_run_id: str | None = None
+
+
 def work_one(conn: psycopg.Connection) -> bool:
     """Claim a run and see it through. False when nothing was queued."""
+    global claimed_run_id
     with conn.cursor() as cur:
         cur.execute("select id, job_type from gea_claim_run()")
         claimed = cur.fetchone()
     conn.commit()
 
     if not claimed:
+        claimed_run_id = None
         return False
 
     run_id, job_type = claimed
+    claimed_run_id = run_id
     log(f"claimed   {job_type}  {run_id}")
 
     def heartbeat(done: int, total: int) -> None:
@@ -334,9 +342,22 @@ def main() -> int:
             continue
 
         except Exception as exc:                               # noqa: BLE001
+            # Something we did not anticipate. The run must not be left
+            # running: a job nobody will ever finish shows as stalled hours
+            # later with no reason attached, and the person reading the screen
+            # has no way to know it is never coming back.
             log(f"error: {exc}")
             try:
                 conn.rollback()
+                if claimed_run_id:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "update analysis_run set status='failed', "
+                            "finished_at=now(), error=%s where id=%s "
+                            "and status='running'",
+                            (f"the service failed unexpectedly: {exc}",
+                             claimed_run_id))
+                    conn.commit()
             except psycopg.Error:
                 # Rolling back on a broken connection throws again. Let the
                 # next pass through the loop deal with it rather than dying
