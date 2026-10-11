@@ -134,6 +134,11 @@ def parse_with_retries(conn, run_id, engagement_id, artefact_ids, heartbeat):
         try:
             return realjobs.parse_export(
                 conn, run_id, engagement_id, artefact_ids, heartbeat)
+        except storage.NotConfigured:
+            # Missing configuration is not a transient problem and retrying it
+            # three times only delays saying so.
+            conn.rollback()
+            raise
         except storage.StorageError as exc:
             conn.rollback()
             # A file that is genuinely absent will still be absent in ten
@@ -307,6 +312,15 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
+    # Everything the worker needs, checked before it reports itself ready. A
+    # worker that starts, sits idle looking healthy and fails on the first real
+    # job is worse than one that refuses to start.
+    try:
+        storage.check_configured()
+    except storage.NotConfigured as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
     try:
         first = psycopg.connect(dsn)
     except psycopg.OperationalError as exc:
@@ -316,6 +330,27 @@ def main() -> int:
         print(f"Could not reach the database. {exc}", file=sys.stderr)
         return 1
     conn = first
+
+    # A run left claimed by a worker that died stays claimed forever: claiming
+    # only takes queued runs, so nothing else will ever touch it. Clear those
+    # before looking for new work.
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select run_id, job_type, abandoned_for "
+                        "from gea_fail_abandoned_runs()")
+            abandoned = cur.fetchall()
+        conn.commit()
+        for _, job_type, silent_for in abandoned:
+            log(f"abandoned {job_type}  claimed by a service that stopped, "
+                f"silent for {silent_for}")
+        if abandoned:
+            log(f"          {len(abandoned)} abandoned "
+                f"{'run' if len(abandoned) == 1 else 'runs'} failed. Redo any "
+                f"that still need doing.")
+    except Exception as exc:                                   # noqa: BLE001
+        # Not a reason to refuse to start: there is still work to do.
+        conn.rollback()
+        log(f"could not check for abandoned runs ({exc})")
 
     log("analysis service started. Ctrl-C to stop.")
     idle_reported = False
