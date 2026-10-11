@@ -249,6 +249,41 @@ def work_one(conn: psycopg.Connection) -> bool:
             f"{output['no_match_found']} with no match")
         return True
 
+    # Analyses that have been built read the client's own data. The rest
+    # still return fixture output and say so by leaving model_name 'stub',
+    # which the database refuses to accept as evidence.
+    if job_type.startswith("analysis:") and \
+            job_type.split(":", 1)[1] in analyses.BUILT:
+        key = job_type.split(":", 1)[1]
+        with conn.cursor() as cur:
+            cur.execute("select engagement_id from analysis_run where id = %s",
+                        (run_id,))
+            engagement_id = cur.fetchone()[0]
+        conn.rollback()
+        try:
+            total, output = analyses.BUILT[key](conn, engagement_id, heartbeat)
+        except (ValueError, storage.StorageError) as exc:
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute("update analysis_run set status='failed', "
+                            "finished_at=now(), error=%s where id=%s",
+                            (str(exc), run_id))
+            conn.commit()
+            log(f"failed    {job_type}  {exc}")
+            return True
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "update analysis_run set status='succeeded', finished_at=now(), "
+                "progress_done=%s, progress_total=%s, compute_output=%s::jsonb, "
+                "model_name=%s where id=%s",
+                (total, total, json.dumps(output), analyses.VERSION, run_id))
+        conn.commit()
+        p = output["population"]
+        log(f"succeeded {job_type}  {p['described']:,} of "
+            f"{p['closed_won']:,} closed-won described")
+        return True
+
     try:
         total, output = fixture(job_type)
     except ValueError as exc:
