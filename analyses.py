@@ -1737,8 +1737,21 @@ def discovery_consistency_classification(conn, engagement_id: str, heartbeat):
             owner_of[nid] = (row.get(cols["note_author"].column_name) or "").strip() \
                 or "unnamed"
 
-    LABELS = ["decision_process", "timeline", "success_criteria",
-              "next_step", "others_involved"]
+    # The questions as GEA-P13 asks them. A screen deriving "Does this
+    # record show decision process?" from a key is asking a different and
+    # vaguer question than the model was asked, and the person answering it
+    # is not checking the same thing.
+    QUESTIONS = {
+        "decision_process": "Does the record state the buyer's own decision "
+                            "process?",
+        "timeline": "Does the record state the buyer's timeline?",
+        "success_criteria": "Does the record state the buyer's own success "
+                            "criteria?",
+        "next_step": "Does the record state an agreed next step?",
+        "others_involved": "Does the record state who else is involved in "
+                           "the decision?",
+    }
+    LABELS = list(QUESTIONS)
     labelled, unread = model.classify(
         records,
         "These are records of discovery conversations written by sales "
@@ -1780,7 +1793,14 @@ def discovery_consistency_classification(conn, engagement_id: str, heartbeat):
                       key=lambda kv: sum(1 for l in LABELS
                                          if kv[1]["labels"][l] == "yes"))
     step = max(1, len(by_score) // 10)
+    # The record's own text travels with it. Without it a person checking
+    # the model can only read the span the model chose to show them, which
+    # is not a check at all: they would be agreeing that the model's own
+    # evidence supports the model's own answer. Ten records of client text,
+    # held under the same rule as everything else raw.
+    text_of = {r["id"]: r["text"] for r in records}
     to_check = [{"record_id": rid,
+                 "record": text_of.get(rid, "")[:4000],
                  "labels": v["labels"], "evidence": v["evidence"],
                  "confidence": v["confidence"]}
                 for rid, v in by_score[::step][:10]]
@@ -1807,6 +1827,7 @@ def discovery_consistency_classification(conn, engagement_id: str, heartbeat):
         "reps_too_few_records_to_report": sum(
             1 for vs in per_rep.values() if len(vs) < MIN_FOR_A_RATE),
         "to_check_by_hand": to_check,
+        "questions": QUESTIONS,
         "low_confidence": sum(1 for v in labelled.values()
                               if v["confidence"] == "low"),
         "model": model.MODEL,
