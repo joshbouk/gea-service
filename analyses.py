@@ -1841,6 +1841,131 @@ def discovery_consistency_classification(conn, engagement_id: str, heartbeat):
     }
 
 
+def adversarial_score_review(conn, engagement_id: str, heartbeat):
+    """Argue against every score before the client sees it.
+
+    This one reads no client export. It reads the scorecard Blend has just
+    written, which makes it the only place in the assessment where the work
+    is turned on itself.
+
+    The two failures worth catching are named in GEA-P17: a four or five
+    awarded on evidence that does not meet the anchor, and a zero or one
+    that confuses an absence of the thing with an absence of evidence about
+    the thing. The second is the one that gets a client angry, because it
+    reads as an accusation when it is a gap in what they record.
+
+    Nothing it produces is binding. Each challenge goes to a person, who
+    defends it with a citation or concedes and moves the score.
+    """
+    model.check_configured()
+
+    with conn.cursor() as cur:
+        cur.execute("select * from gea_scorecard_for_review(%s)",
+                    (engagement_id,))
+        cols = [d.name for d in cur.description]
+        scored = [dict(zip(cols, row)) for row in cur.fetchall()]
+    conn.rollback()
+
+    if not scored:
+        raise ValueError(
+            "nothing has been scored yet, so there is nothing to argue with")
+
+    # One element per record, so the review argues with a score rather than
+    # summarising a scorecard. Batched by the model layer.
+    records = []
+    for e in scored:
+        reads = ("not evidenced" if e["not_evidenced"]
+                 else str(e["value"]))
+        cites = "; ".join(
+            f"{c.get('what')}{': ' + c['note'] if c.get('note') else ''}"
+            for c in (e["citations"] or [])) or "nothing cited"
+        records.append({
+            "id": e["element_ref"],
+            "text": (
+                f"ELEMENT {e['element_ref']}: {e['element_name']}\n"
+                f"WHY IT IS ASSESSED: {e['why_assessed'] or ''}\n"
+                f"SCORE GIVEN: {reads}\n"
+                + (f"REASON RECORDED FOR NOT EVIDENCED: {e['ne_reason']}\n"
+                   if e["not_evidenced"] and e["ne_reason"] else "")
+                + (f"THE ANCHOR THIS SCORE CLAIMS: {e['anchor_claimed']}\n"
+                   if e["anchor_claimed"] else "")
+                + (f"THE ANCHOR BELOW IT: {e['anchor_below']}\n"
+                   if e["anchor_below"] else "")
+                + (f"THE ANCHOR ABOVE IT: {e['anchor_above']}\n"
+                   if e["anchor_above"] else "")
+                + (f"CAPPED AT: {e['cap_applied']}\n"
+                   if e["cap_applied"] is not None else "")
+                + (f"CONFIDENCE FLAGGED: {e['confidence']}\n"
+                   if e["confidence"] else "")
+                + f"WHAT THE SCORER WROTE: {e['scoring_note'] or 'nothing'}\n"
+                + f"WHAT IT RESTS ON: {cites}"),
+        })
+
+    LABELS = ["evidence_does_not_meet_the_anchor",
+              "absence_of_evidence_read_as_absence_of_the_thing",
+              "citation_too_vague_to_retrieve",
+              "should_be_a_limitation_not_a_score"]
+    labelled, unread = model.classify(
+        records,
+        "Each record is one element of a completed assessment, with the "
+        "score given, the anchor that score claims, the anchors either side "
+        "of it, and what the score rests on.\n\n"
+        "Argue against the score. Do not confirm it. Do not suggest wording "
+        "for a report.\n\n"
+        "Answer yes where the fault is present:\n"
+        "- evidence_does_not_meet_the_anchor: what the score rests on does "
+        "not satisfy what the claimed anchor requires.\n"
+        "- absence_of_evidence_read_as_absence_of_the_thing: a low score "
+        "treats missing records as proof the practice is missing. These are "
+        "different, and only the first is evidenced.\n"
+        "- citation_too_vague_to_retrieve: a colleague could not find the "
+        "same evidence from what is cited.\n"
+        "- should_be_a_limitation_not_a_score: confidence is low enough "
+        "that publishing a number would overstate what is known.\n\n"
+        "Your evidence quotation must come from the record, and it must be "
+        "the part that shows the fault.",
+        LABELS, heartbeat=heartbeat)
+
+    challenges = []
+    for ref, v in labelled.items():
+        faults = [l for l in LABELS if v["labels"][l] == "yes"]
+        if not faults:
+            continue
+        e = next(x for x in scored if x["element_ref"] == ref)
+        reads = "not evidenced" if e["not_evidenced"] else str(e["value"])
+        for fault in faults:
+            challenges.append({
+                "element_ref": ref,
+                "weakness_type": fault,
+                "challenge": (
+                    f"{fault.replace('_', ' ').capitalize()}. "
+                    f"{e['element_name']} reads {reads} and rests on "
+                    f"{'nothing cited' if not e['citations'] else 'what is cited'}. "
+                    f"The review points at: {v['evidence']}"),
+                "confidence": v["confidence"],
+            })
+
+    unchallenged = len(scored) - len({c["element_ref"] for c in challenges})
+    return len(challenges), {
+        "analysis": "adversarial_score_review",
+        "population": {
+            "elements_scored": len(scored),
+            "elements_reviewed": len(labelled),
+            "elements_the_model_did_not_return": len(unread),
+            "elements_with_nothing_argued": unchallenged,
+        },
+        "challenges": challenges,
+        "review_complete": not unread,
+        "by_fault": {l: sum(1 for c in challenges if c["weakness_type"] == l)
+                     for l in LABELS},
+        "model": model.MODEL,
+        "note": "Nothing here is binding. Each challenge goes to a person "
+                "who defends the score with its citation or concedes and "
+                "changes it. An element with nothing argued is not thereby "
+                "confirmed: it is an element this review found no fault in.",
+    }
+
+
 # What each analysis actually reads.
 #
 # Three analyses have now been built needing a field they never declared, and
@@ -1940,4 +2065,5 @@ BUILT = {
     "signal_to_first_contact": signal_to_first_contact,
     "note_sufficiency": note_sufficiency,
     "discovery_consistency_classification": discovery_consistency_classification,
+    "adversarial_score_review": adversarial_score_review,
 }
