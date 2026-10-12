@@ -1693,6 +1693,133 @@ def note_sufficiency(conn, engagement_id: str, heartbeat):
     }
 
 
+def discovery_consistency_classification(conn, engagement_id: str, heartbeat):
+    """What the discovery conversations actually recorded, on every deal.
+
+    A census rather than a sample, because the finding is a distribution
+    and a sample of thirty cannot be cut by rep. Every record is read, and
+    whether every record was read is reported: an analysis that quietly
+    skipped a fifth of the notes would describe four fifths of the client.
+
+    Five questions per record, each answered only where the record states
+    it. A rep's assumption, an implication, or the model's own inference is
+    a no, and the span of text behind each answer comes back with it so a
+    person can check ten of them at step 2.4.
+
+    Reps are named Rep 1, Rep 2 and so on. The finding is about the
+    practice, not about who is worst at it, and a report that names people
+    stops being read as an assessment.
+    """
+    cols = resolve_columns(conn, engagement_id,
+                           "discovery_consistency_classification")
+    needed = ["note_id", "note_body", "note_author", "note_created_at",
+              "note_opportunity_id", "activity_owner"]
+    absent = [k for k in needed if k not in cols]
+    if absent:
+        raise ValueError("this analysis needs fields that are not mapped: "
+                         + ", ".join(absent))
+
+    model.check_configured()
+
+    records: list[dict] = []
+    owner_of: dict[str, str] = {}
+    read = thin = 0
+    with storage.download(cols["note_body"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            read += 1
+            body = (row.get(cols["note_body"].column_name) or "").strip()
+            nid = (row.get(cols["note_id"].column_name) or "").strip()
+            if not nid or len(body.split()) < SUBSTANTIVE_WORDS:
+                thin += 1
+                continue
+            records.append({"id": nid, "text": body})
+            owner_of[nid] = (row.get(cols["note_author"].column_name) or "").strip() \
+                or "unnamed"
+
+    LABELS = ["decision_process", "timeline", "success_criteria",
+              "next_step", "others_involved"]
+    labelled, unread = model.classify(
+        records,
+        "These are records of discovery conversations written by sales "
+        "people. For each, answer whether the record states the buyer's own "
+        "decision process, the buyer's timeline, the buyer's success "
+        "criteria, an agreed next step, and who else is involved in the "
+        "decision. Answer yes only where the record says it. An assumption "
+        "by the writer, an implication, or your own inference is a no.",
+        LABELS, heartbeat=heartbeat)
+
+    n = len(labelled)
+    rates = {l: (round(sum(1 for v in labelled.values()
+                           if v["labels"][l] == "yes") / n, 4)
+                 if n >= MIN_FOR_A_RATE else None) for l in LABELS}
+
+    all_five = sum(1 for v in labelled.values()
+                   if all(v["labels"][l] == "yes" for l in LABELS))
+    none_of_five = sum(1 for v in labelled.values()
+                       if all(v["labels"][l] == "no" for l in LABELS))
+
+    # By rep, anonymised, and only where there are enough records to say
+    # anything. A rep with four notes is not a pattern.
+    per_rep: dict[str, list] = defaultdict(list)
+    for rid, v in labelled.items():
+        per_rep[owner_of[rid]].append(v)
+    reps = []
+    for i, (_name, vs) in enumerate(
+            sorted(per_rep.items(), key=lambda x: -len(x[1])), 1):
+        if len(vs) < MIN_FOR_A_RATE:
+            continue
+        reps.append({"rep": f"Rep {i}", "records": len(vs),
+                     **{l: round(sum(1 for v in vs if v["labels"][l] == "yes")
+                                 / len(vs), 4) for l in LABELS}})
+
+    # The ten a person reads at step 2.4. Spread across the distribution
+    # rather than taken off the top, so the check covers the easy records
+    # and the hard ones.
+    by_score = sorted(labelled.items(),
+                      key=lambda kv: sum(1 for l in LABELS
+                                         if kv[1]["labels"][l] == "yes"))
+    step = max(1, len(by_score) // 10)
+    to_check = [{"record_id": rid,
+                 "labels": v["labels"], "evidence": v["evidence"],
+                 "confidence": v["confidence"]}
+                for rid, v in by_score[::step][:10]]
+
+    census_complete = not unread and bool(records)
+    return n, {
+        "analysis": "discovery_consistency_classification",
+        "population": {
+            "records_read": read,
+            "records_too_thin_to_classify": thin,
+            "records_offered_to_the_model": len(records),
+            "records_classified": n,
+            "records_the_model_did_not_return": len(unread),
+        },
+        "census_complete": census_complete,
+        "rates": rates,
+        "recorded_all_five": all_five,
+        "recorded_all_five_share": (round(all_five / n, 4)
+                                    if n >= MIN_FOR_A_RATE else None),
+        "recorded_none_of_the_five": none_of_five,
+        "recorded_none_of_the_five_share": (round(none_of_five / n, 4)
+                                            if n >= MIN_FOR_A_RATE else None),
+        "by_rep": reps,
+        "reps_too_few_records_to_report": sum(
+            1 for vs in per_rep.values() if len(vs) < MIN_FOR_A_RATE),
+        "to_check_by_hand": to_check,
+        "low_confidence": sum(1 for v in labelled.values()
+                              if v["confidence"] == "low"),
+        "model": model.MODEL,
+        "rates_suppressed_below": MIN_FOR_A_RATE,
+        "note": "A census: every substantive record was offered to the "
+                "model. Where census_complete is false some records came "
+                "back unreadable and the rates describe only the rest. The "
+                "ten records listed for checking are spread across the "
+                "distribution, and reading them is what makes the rest "
+                "trustworthy.",
+    }
+
+
 # What each analysis actually reads.
 #
 # Three analyses have now been built needing a field they never declared, and
@@ -1740,6 +1867,9 @@ NEEDS = {
         "note_id", "note_body", "note_author", "note_created_at",
         "note_opportunity_id", "meeting_at", "opportunity_id",
         "opportunity_status"],
+    "discovery_consistency_classification": [
+        "note_id", "note_body", "note_author", "note_created_at",
+        "note_opportunity_id", "activity_owner"],
 }
 
 
@@ -1788,4 +1918,5 @@ BUILT = {
     "renewal_timing_and_reason": renewal_timing_and_reason,
     "signal_to_first_contact": signal_to_first_contact,
     "note_sufficiency": note_sufficiency,
+    "discovery_consistency_classification": discovery_consistency_classification,
 }
