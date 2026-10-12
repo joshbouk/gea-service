@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import csv
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 
 import csvjobs
+import model
 import storage
 
 VERSION = "analysis-1"
@@ -1494,6 +1495,284 @@ def signal_to_first_contact(conn, engagement_id: str, heartbeat):
     }
 
 
+def working_days_between(a, b) -> int:
+    """Working days, because two days over a weekend is not two days late."""
+    if a is None or b is None:
+        return 0
+    step = 1 if b >= a else -1
+    days, cur = 0, a
+    while cur != b:
+        cur += timedelta(days=step)
+        if cur.weekday() < 5:
+            days += step
+    return days
+
+
+# A note of three words is a note in the export and nothing in practice.
+# "Called." and "n/a" are the commonest, and counting them as coverage is
+# how a client comes to believe their notes are good.
+SUBSTANTIVE_WORDS = 10
+
+
+def note_sufficiency(conn, engagement_id: str, heartbeat):
+    """Whether the client's notes can carry an assessment at all.
+
+    Four conditions, and the verdict is computed from all four. Three of
+    them are counted: how many closed opportunities carry a substantive
+    note, separately for won and lost because notes cluster on deals that
+    went well, and how many notes were written within two working days of
+    the meeting they describe.
+
+    The fourth is read. A sample of thirty notes across at least three
+    authors is labelled for what the buyer actually said — decision
+    process, timeline, success criteria, agreed next step — and for whether
+    the note follows any recognisable structure.
+
+    The model never returns the verdict or the rates. It labels, and the
+    arithmetic happens here where it can be checked. A near miss is a fail.
+    """
+    cols = resolve_columns(conn, engagement_id, "note_sufficiency")
+    needed = ["note_id", "note_body", "note_author", "note_created_at",
+              "note_opportunity_id", "meeting_at"]
+    absent = [k for k in needed if k not in cols]
+    if absent:
+        raise ValueError("this analysis needs fields that are not mapped: "
+                         + ", ".join(absent))
+
+    model.check_configured()
+
+    # Which opportunities closed, and which way.
+    heartbeat(0, 3)
+    closed: dict[str, str] = {}
+    if "opportunity_id" in cols and "opportunity_status" in cols:
+        with storage.download(cols["opportunity_id"].storage_path).open(
+                "r", encoding="utf-8-sig", newline="") as fh:
+            for row in csv.DictReader(fh):
+                result = outcome(row.get(cols["opportunity_status"].column_name))
+                key = (row.get(cols["opportunity_id"].column_name) or "").strip()
+                if key and result:
+                    closed[key] = result
+    heartbeat(1, 3)
+
+    notes: list[dict] = []
+    with_note: dict[str, set] = {"won": set(), "lost": set()}
+    by_author: dict[str, list[dict]] = defaultdict(list)
+    read = thin = 0
+    on_time = datable = 0
+
+    with storage.download(cols["note_body"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            read += 1
+            body = (row.get(cols["note_body"].column_name) or "").strip()
+            if len(body.split()) < SUBSTANTIVE_WORDS:
+                thin += 1
+                continue
+            nid = (row.get(cols["note_id"].column_name) or "").strip()
+            author = (row.get(cols["note_author"].column_name) or "").strip()
+            deal = (row.get(cols["note_opportunity_id"].column_name) or "").strip()
+            written = a_date(row.get(cols["note_created_at"].column_name))
+            met = a_date(row.get(cols["meeting_at"].column_name))
+
+            if deal in closed:
+                with_note[closed[deal]].add(deal)
+            if written and met:
+                datable += 1
+                if 0 <= working_days_between(met, written) <= 2:
+                    on_time += 1
+            if nid and body:
+                note = {"id": nid, "text": body, "author": author or "unnamed"}
+                notes.append(note)
+                by_author[note["author"]].append(note)
+    heartbeat(2, 3)
+
+    won_total = sum(1 for v in closed.values() if v == "won")
+    lost_total = sum(1 for v in closed.values() if v == "lost")
+
+    def rate(part, whole):
+        return round(part / whole, 4) if whole >= MIN_FOR_A_RATE else None
+
+    coverage_won = rate(len(with_note["won"]), won_total)
+    coverage_lost = rate(len(with_note["lost"]), lost_total)
+    contemporaneity = rate(on_time, datable)
+
+    # Thirty notes across at least three authors. Spread across authors
+    # deliberately: thirty notes from the one person who writes properly
+    # would describe that person, not the client.
+    sample: list[dict] = []
+    authors = sorted(by_author, key=lambda a: -len(by_author[a]))
+    per_author = max(1, 30 // max(len(authors), 1))
+    for a in authors:
+        sample.extend(by_author[a][:per_author])
+    # Top up from the authors who write most, so a client with four authors
+    # gets thirty notes rather than twenty-eight.
+    for a in authors:
+        if len(sample) >= 30:
+            break
+        sample.extend(by_author[a][per_author:per_author + (30 - len(sample))])
+    sample = sample[:30]
+
+    LABELS = ["decision_process", "timeline", "success_criteria",
+              "next_step", "follows_a_structure"]
+    labelled, unread = ({}, [])
+    if sample:
+        labelled, unread = model.classify(
+            sample,
+            "These are notes written by sales people after customer "
+            "conversations. For each, answer whether the note records the "
+            "buyer's own stated position on their decision process, their "
+            "timeline, their success criteria, and an agreed next step; and "
+            "whether the note follows a recognisable structure such as "
+            "headings or consistent sections rather than free prose.",
+            LABELS, heartbeat=None)
+    heartbeat(3, 3)
+
+    n = len(labelled)
+    content = {l: (round(sum(1 for v in labelled.values()
+                            if v["labels"][l] == "yes") / n, 4)
+                   if n >= MIN_FOR_A_RATE else None)
+               for l in LABELS[:4]}
+
+    # Structure is consistent when most notes have one and the authors agree.
+    # Computed, not asked for.
+    author_of = {x["id"]: x["author"] for x in sample}
+    structured: dict[str, list] = defaultdict(list)
+    for rid, v in labelled.items():
+        structured[author_of[rid]].append(v)
+    by_author_rate = {
+        a: sum(1 for v in vs if v["labels"]["follows_a_structure"] == "yes") / len(vs)
+        for a, vs in structured.items() if len(vs) >= 3}
+    overall_structure = (round(sum(1 for v in labelled.values()
+                                   if v["labels"]["follows_a_structure"] == "yes") / n, 4)
+                         if n >= MIN_FOR_A_RATE else None)
+    structure_consistent = (
+        overall_structure is not None and overall_structure >= 0.70
+        and len(by_author_rate) >= 2
+        and (max(by_author_rate.values()) - min(by_author_rate.values())) <= 0.30)
+
+    failed = []
+    if coverage_won is None or coverage_won < 0.90:
+        failed.append("coverage of closed-won opportunities")
+    if not structure_consistent:
+        failed.append("consistent structure across authors")
+    for l, v in content.items():
+        if v is None or v < 0.70:
+            failed.append(l.replace("_", " "))
+    if contemporaneity is None or contemporaneity < 0.80:
+        failed.append("notes written within two working days")
+
+    return read, {
+        "analysis": "note_sufficiency",
+        "population": {
+            "notes_read": read,
+            "notes_too_thin_to_count": thin,
+            "closed_won": won_total, "closed_lost": lost_total,
+            "notes_datable_against_a_meeting": datable,
+        },
+        "coverage_won": coverage_won,
+        "coverage_won_of": won_total,
+        "coverage_lost": coverage_lost,
+        "coverage_lost_of": lost_total,
+        "contemporaneity": contemporaneity,
+        "contemporaneity_of": datable,
+        "content_rates": content,
+        "structure_rate": overall_structure,
+        "structure_by_author": {f"Author {i}": round(v, 4)
+                                for i, v in enumerate(by_author_rate.values(), 1)},
+        "structure_consistent": structure_consistent,
+        "sample": {"size": len(sample), "authors": len(by_author_rate),
+                   "labelled": n, "unread": len(unread)},
+        "verdict": "PASS" if not failed else "FAIL",
+        "failed_on": failed,
+        "model": model.MODEL,
+        "rates_suppressed_below": MIN_FOR_A_RATE,
+        "note": "The verdict is computed from all four conditions. A near "
+                "miss is a fail. Notes under ten words are counted as too "
+                "thin rather than as coverage: a note saying Called. is a "
+                "note in the export and nothing in practice.",
+    }
+
+
+# What each analysis actually reads.
+#
+# Three analyses have now been built needing a field they never declared, and
+# each time the symptom was a figure quietly coming out as nought rather than
+# an error. The requirements were authored from the prompt text, which says
+# what to analyse; this says what to read, and the two are not the same.
+#
+# gea_check_declared() compares these against the instrument, so the next one
+# is caught before anybody reads its output.
+NEEDS = {
+    "icp_reconciliation": [
+        "opportunity_account_id", "opportunity_status", "account_id",
+        "account_industry", "account_country", "account_employee_count",
+        "account_annual_revenue"],
+    "win_loss_and_churn_patterns": [
+        "opportunity_id", "opportunity_status", "opportunity_account_id",
+        "loss_reason", "account_id", "account_industry",
+        "account_employee_count"],
+    "price_discount_dispersion": [
+        "opportunity_id", "opportunity_status", "opportunity_list_price",
+        "opportunity_realised_price"],
+    "stage_conversion_and_duration": [
+        "opportunity_id", "opportunity_status", "stage_history_opportunity_id",
+        "stage_history_to", "stage_entered_at"],
+    "cost_per_qualified_opportunity": [
+        "opportunity_id", "channel_source", "qualified_at", "spend_amount",
+        "spend_channel", "spend_month"],
+    "forecast_accuracy": [
+        "forecast_period", "forecast_amount", "forecast_actual_amount"],
+    "buying_group_composition": [
+        "opportunity_id", "opportunity_status", "contact_role",
+        "contact_role_opportunity_id", "contact_role_contact_id"],
+    "handover_completeness_census": [
+        "opportunity_id", "opportunity_status", "opportunity_account_id",
+        "contact_role", "contact_role_opportunity_id", "activity_id",
+        "activity_opportunity_id", "activity_type"],
+    "expansion_vs_new_business": [
+        "opportunity_id", "opportunity_status", "opportunity_type",
+        "opportunity_account_id"],
+    "renewal_timing_and_reason": [
+        "subscription_id", "renewal_date", "renewal_outcome"],
+    "signal_to_first_contact": [
+        "contact_id", "activity_id", "activity_contact_id", "activity_at"],
+    "note_sufficiency": [
+        "note_id", "note_body", "note_author", "note_created_at",
+        "note_opportunity_id", "meeting_at", "opportunity_id",
+        "opportunity_status"],
+}
+
+
+def check_declared(conn) -> list[str]:
+    """Every field an analysis reads must be one the instrument requires.
+
+    Run at startup. A field the implementation reads but the instrument does
+    not require is invisible to capability, never mapped, and comes back
+    empty — so the analysis computes a figure from nothing and reports it
+    without complaint.
+    """
+    problems = []
+    with conn.cursor() as cur:
+        cur.execute("""
+            select r.analysis_key, cf.key
+              from analysis_field_requirement r
+              join canonical_field cf on cf.id = r.canonical_field_id
+              join instrument_version iv on iv.id = r.instrument_version_id
+             where iv.status = 'active'
+        """)
+        declared: dict[str, set] = defaultdict(set)
+        for key, field in cur.fetchall():
+            declared[key].add(field)
+    for key, needs in NEEDS.items():
+        missing = sorted(set(needs) - declared.get(key, set()))
+        if missing:
+            problems.append(
+                f"{key} reads {', '.join(missing)}, which the instrument does "
+                f"not require. It will never be mapped, and the analysis will "
+                f"compute from nothing.")
+    return problems
+
+
 # The analyses that read real data. Everything not here is still a fixture,
 # and the database refuses to accept a fixture as evidence.
 BUILT = {
@@ -1508,4 +1787,5 @@ BUILT = {
     "expansion_vs_new_business": expansion_vs_new_business,
     "renewal_timing_and_reason": renewal_timing_and_reason,
     "signal_to_first_contact": signal_to_first_contact,
+    "note_sufficiency": note_sufficiency,
 }

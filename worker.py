@@ -40,6 +40,8 @@ from datetime import datetime, timezone
 
 import psycopg
 
+import analyses
+import model
 import realjobs
 import storage
 from csvjobs import ParseError
@@ -356,6 +358,13 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
+    # The analyses that read what people wrote need a model. Say so now
+    # rather than when the first one is claimed.
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("ANTHROPIC_API_KEY is not set. Everything that counts will "
+              "run; the analyses that read what people wrote will fail when "
+              "they are started.", file=sys.stderr)
+
     try:
         first = psycopg.connect(dsn)
     except psycopg.OperationalError as exc:
@@ -386,6 +395,24 @@ def main() -> int:
         # Not a reason to refuse to start: there is still work to do.
         conn.rollback()
         log(f"could not check for abandoned runs ({exc})")
+
+    # Every field an analysis reads must be one the instrument requires.
+    # Otherwise it is never mapped, comes back empty, and the analysis
+    # computes a figure from nothing without complaining.
+    try:
+        problems = analyses.check_declared(conn)
+        conn.rollback()
+    except Exception as exc:                                   # noqa: BLE001
+        # Not something to log past. This check exists to catch a whole class
+        # of silent wrongness — an analysis computing a figure from a field
+        # nobody mapped — and a check that quietly fails to run is worse than
+        # no check, because it looks like one.
+        conn.rollback()
+        print(f"Could not check what the analyses read: {exc}", file=sys.stderr)
+        return 1
+
+    for problem in problems:
+        log(f"warning: {problem}")
 
     log("analysis service started. Ctrl-C to stop.")
     idle_reported = False
