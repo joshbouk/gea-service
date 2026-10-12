@@ -932,6 +932,568 @@ def forecast_accuracy(conn, engagement_id: str, heartbeat):
     }
 
 
+def buying_group_composition(conn, engagement_id: str, heartbeat):
+    """How many people are involved in a deal, and who.
+
+    The number that matters is how many deals have exactly one named
+    contact. A single-threaded deal is one resignation away from starting
+    again, and a client whose deals are mostly single-threaded has a risk
+    they can see in a sentence.
+    """
+    cols = resolve_columns(conn, engagement_id, "buying_group_composition")
+    needed = ["opportunity_id", "opportunity_status", "contact_role",
+              "contact_role_opportunity_id", "contact_role_contact_id"]
+    absent = [k for k in needed if k not in cols]
+    if absent:
+        raise ValueError("this analysis needs fields that are not mapped: "
+                         + ", ".join(absent))
+
+    heartbeat(0, 3)
+    outcomes = {}
+    with storage.download(cols["opportunity_id"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            key = (row.get(cols["opportunity_id"].column_name) or "").strip()
+            if key:
+                outcomes[key] = outcome(row.get(cols["opportunity_status"].column_name))
+    heartbeat(1, 3)
+
+    # Contacts, where that export is here, so roles can carry seniority.
+    people = {}
+    if "contact_id" in cols:
+        with storage.download(cols["contact_id"].storage_path).open(
+                "r", encoding="utf-8-sig", newline="") as fh:
+            for row in csv.DictReader(fh):
+                key = (row.get(cols["contact_id"].column_name) or "").strip()
+                if key:
+                    people[key] = {
+                        n: row.get(cols[f].column_name)
+                        for n, f in (("seniority", "contact_seniority"),
+                                     ("function", "contact_function"),
+                                     ("title", "contact_job_title"))
+                        if f in cols}
+    heartbeat(2, 3)
+
+    per_deal: dict[str, set] = defaultdict(set)
+    roles, seniorities, functions = Cut("role"), Cut("seniority"), Cut("function")
+    role_rows = orphan = 0
+    with storage.download(cols["contact_role"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            role_rows += 1
+            deal = (row.get(cols["contact_role_opportunity_id"].column_name) or "").strip()
+            person = (row.get(cols["contact_role_contact_id"].column_name) or "").strip()
+            if not deal or deal not in outcomes:
+                orphan += 1
+                continue
+            per_deal[deal].add(person)
+            roles.add(row.get(cols["contact_role"].column_name))
+            who = people.get(person)
+            if who:
+                seniorities.add(who.get("seniority"))
+                functions.add(who.get("function"))
+    heartbeat(3, 3)
+
+    sizes = Counter(len(v) for v in per_deal.values())
+    with_roles = len(per_deal)
+    decided = sum(1 for o in outcomes.values() if o is not None)
+    single = sizes.get(1, 0)
+
+    # Won deals against lost, by how many people were involved.
+    by_size: dict[int, dict] = defaultdict(lambda: {"won": 0, "lost": 0})
+    for deal, contacts in per_deal.items():
+        r = outcomes.get(deal)
+        if r:
+            by_size[len(contacts)][r] += 1
+
+    out = {
+        "analysis": "buying_group_composition",
+        "population": {
+            "deals_in_the_export": len(outcomes),
+            "deals_with_a_named_contact": with_roles,
+            "deals_with_nobody_named": len(outcomes) - with_roles,
+            "contact_role_rows_read": role_rows,
+            "contact_role_rows_for_a_deal_not_in_the_export": orphan,
+        },
+        "single_threaded": single,
+        "single_threaded_share": (round(single / with_roles, 4)
+                                  if with_roles >= MIN_FOR_A_RATE else None),
+        "people_per_deal": [
+            {"people": k, "deals": v, "of": with_roles,
+             "share": round(v / with_roles, 4) if with_roles >= MIN_FOR_A_RATE else None}
+            for k, v in sorted(sizes.items())],
+        "outcome_by_group_size": [
+            {"people": k, "won": v["won"], "lost": v["lost"],
+             "of": v["won"] + v["lost"],
+             "win_rate": (round(v["won"] / (v["won"] + v["lost"]), 4)
+                          if v["won"] + v["lost"] >= MIN_FOR_A_RATE else None)}
+            for k, v in sorted(by_size.items())],
+        "roles": roles.as_dict(role_rows),
+        "rates_suppressed_below": MIN_FOR_A_RATE,
+        "note": "A deal with one named contact is single-threaded. Deals with "
+                "nobody named are counted separately: that is a recording "
+                "failure, not a buying group of nought.",
+    }
+    if people:
+        out["seniority"] = seniorities.as_dict(role_rows)
+        out["function"] = functions.as_dict(role_rows)
+    return with_roles, out
+
+
+def handover_completeness_census(conn, engagement_id: str, heartbeat):
+    """What actually crosses from sales to delivery, on every won deal.
+
+    A census, not a sample. For each closed-won deal, which of the things a
+    handover needs are on the record: who bought, who owns the account, what
+    was discussed, and whether anything happened after the sale.
+
+    Each is counted on its own. A deal with three of four is not
+    three-quarters handed over; it is missing the fourth, and which one is
+    missing is the finding.
+    """
+    cols = resolve_columns(conn, engagement_id, "handover_completeness_census")
+    needed = ["opportunity_id", "opportunity_status", "opportunity_account_id",
+              "contact_role", "contact_role_opportunity_id",
+              "activity_id", "activity_opportunity_id", "activity_type"]
+    absent = [k for k in needed if k not in cols]
+    if absent:
+        raise ValueError("this analysis needs fields that are not mapped: "
+                         + ", ".join(absent))
+
+    heartbeat(0, 4)
+    won_deals: dict[str, str] = {}
+    with storage.download(cols["opportunity_id"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            if outcome(row.get(cols["opportunity_status"].column_name)) != "won":
+                continue
+            key = (row.get(cols["opportunity_id"].column_name) or "").strip()
+            if key:
+                won_deals[key] = (row.get(cols["opportunity_account_id"].column_name) or "").strip()
+    heartbeat(1, 4)
+
+    has_role = set()
+    with storage.download(cols["contact_role"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            deal = (row.get(cols["contact_role_opportunity_id"].column_name) or "").strip()
+            if deal in won_deals and (row.get(cols["contact_role"].column_name) or "").strip():
+                has_role.add(deal)
+    heartbeat(2, 4)
+
+    has_activity = set()
+    activity_types = Cut("activity type")
+    with storage.download(cols["activity_id"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            deal = (row.get(cols["activity_opportunity_id"].column_name) or "").strip()
+            if deal in won_deals:
+                has_activity.add(deal)
+                activity_types.add(row.get(cols["activity_type"].column_name))
+    heartbeat(3, 4)
+
+    has_note = set()
+    if "note_opportunity_id" in cols:
+        with storage.download(cols["note_opportunity_id"].storage_path).open(
+                "r", encoding="utf-8-sig", newline="") as fh:
+            for row in csv.DictReader(fh):
+                deal = (row.get(cols["note_opportunity_id"].column_name) or "").strip()
+                if deal in won_deals:
+                    has_note.add(deal)
+
+    has_owner = set()
+    if "account_owner" in cols and "account_id" in cols:
+        owners = {}
+        with storage.download(cols["account_id"].storage_path).open(
+                "r", encoding="utf-8-sig", newline="") as fh:
+            for row in csv.DictReader(fh):
+                key = (row.get(cols["account_id"].column_name) or "").strip()
+                val = (row.get(cols["account_owner"].column_name) or "").strip()
+                if key and val and not is_a_non_answer(val):
+                    owners[key] = val
+        has_owner = {d for d, acct in won_deals.items() if acct in owners}
+    heartbeat(4, 4)
+
+    n = len(won_deals)
+    checks = [("somebody named on the deal", has_role),
+              ("something recorded against it", has_activity)]
+    if "note_opportunity_id" in cols:
+        checks.append(("a written record of the conversation", has_note))
+    if has_owner or ("account_owner" in cols and "account_id" in cols):
+        checks.append(("an owner on the account", has_owner))
+
+    present = []
+    for label, found in checks:
+        present.append({
+            "what": label, "deals_with_it": len(found), "of": n,
+            "share": round(len(found) / n, 4) if n >= MIN_FOR_A_RATE else None,
+        })
+    complete = set(won_deals) 
+    for _label, found in checks:
+        complete &= found
+    nothing = set(won_deals)
+    for _label, found in checks:
+        nothing -= found
+
+    return n, {
+        "analysis": "handover_completeness_census",
+        "population": {"closed_won": n, "checks_made": len(checks)},
+        "each_part": present,
+        "deals_with_every_part": len(complete),
+        "deals_with_every_part_share": (round(len(complete) / n, 4)
+                                        if n >= MIN_FOR_A_RATE else None),
+        "deals_with_no_part_at_all": len(nothing),
+        "activity_types": activity_types.as_dict(len(has_activity)),
+        "parts_not_checked_because_the_field_is_not_mapped": [
+            label for label, field in
+            (("a written record of the conversation", "note_opportunity_id"),
+             ("an owner on the account", "account_owner"))
+            if field not in cols],
+        "rates_suppressed_below": MIN_FOR_A_RATE,
+        "note": "A census of every closed-won deal. Each part is counted on "
+                "its own: a deal with three of four is missing the fourth, "
+                "and which one is missing is the finding.",
+    }
+
+
+def expansion_vs_new_business(conn, engagement_id: str, heartbeat):
+    """How much of the growth comes from customers they already had.
+
+    Deals are classified by the type the client records, not inferred. Where
+    the type is missing or is a non-answer the deal is counted as
+    unclassified, not assumed to be new business — which is the assumption
+    that flatters a land-and-expand story.
+
+    Value comes from the subscriptions, where the client records what a
+    customer is actually worth and what was added. A deal amount is what was
+    signed; annual recurring revenue is what was kept.
+    """
+    cols = resolve_columns(conn, engagement_id, "expansion_vs_new_business")
+    needed = ["opportunity_id", "opportunity_status", "opportunity_type",
+              "opportunity_account_id"]
+    absent = [k for k in needed if k not in cols]
+    if absent:
+        raise ValueError("this analysis needs fields that are not mapped: "
+                         + ", ".join(absent))
+
+    types = Cut("opportunity type")
+    won = unclassified = read = 0
+    by_type: Counter = Counter()
+    accounts_won: dict[str, set] = defaultdict(set)
+
+    with storage.download(cols["opportunity_id"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            read += 1
+            if outcome(row.get(cols["opportunity_status"].column_name)) != "won":
+                continue
+            won += 1
+            raw = row.get(cols["opportunity_type"].column_name)
+            types.add(raw)
+            if raw is None or str(raw).strip() == "" or is_a_non_answer(raw):
+                unclassified += 1
+                label = "not classified"
+            else:
+                label = str(raw).strip()
+            by_type[label] += 1
+            acct = (row.get(cols["opportunity_account_id"].column_name) or "").strip()
+            if acct:
+                accounts_won[label].add(acct)
+    heartbeat(1, 2)
+
+    # What those customers are worth, from the subscriptions.
+    recurring = expansion = 0.0
+    subs = subs_unpriced = 0
+    if "subscription_id" in cols and "arr_amount" in cols:
+        with storage.download(cols["subscription_id"].storage_path).open(
+                "r", encoding="utf-8-sig", newline="") as fh:
+            for row in csv.DictReader(fh):
+                subs += 1
+                arr = money(row.get(cols["arr_amount"].column_name))
+                if arr is None:
+                    subs_unpriced += 1
+                else:
+                    recurring += arr
+                if "expansion_amount" in cols:
+                    add = money(row.get(cols["expansion_amount"].column_name))
+                    if add is not None:
+                        expansion += add
+    heartbeat(2, 2)
+
+    return won, {
+        "analysis": "expansion_vs_new_business",
+        "population": {
+            "deals_read": read, "closed_won": won,
+            "not_classified": unclassified,
+            "subscriptions_read": subs,
+            "subscriptions_with_no_recurring_revenue": subs_unpriced,
+        },
+        "won_by_type": types.as_dict(won),
+        "accounts_by_type": [{"type": k, "accounts": len(v)}
+                             for k, v in sorted(accounts_won.items())],
+        "recurring_revenue": round(recurring, 2) if subs else None,
+        "from_expansion": round(expansion, 2) if subs else None,
+        "expansion_share_of_recurring_revenue": (
+            round(expansion / recurring, 4)
+            if subs and recurring > 0 else None),
+        "value_not_measured_because_the_field_is_not_mapped":
+            "arr_amount" not in cols,
+        "rates_suppressed_below": MIN_FOR_A_RATE,
+        "note": "Deals are classified by the type the client records. A deal "
+                "with no type is counted as unclassified, not as new "
+                "business. Value comes from recurring revenue, not deal "
+                "amounts.",
+    }
+
+
+def renewal_timing_and_reason(conn, engagement_id: str, heartbeat):
+    """Whether renewals are run, or just happen.
+
+    How far ahead of the contract end a renewal was settled is the number
+    that separates a renewal process from a renewal date. A renewal recorded
+    on or after the end date was not managed, whatever its outcome.
+    """
+    cols = resolve_columns(conn, engagement_id, "renewal_timing_and_reason")
+    needed = ["subscription_id", "renewal_date", "renewal_outcome"]
+    absent = [k for k in needed if k not in cols]
+    if absent:
+        raise ValueError("this analysis needs fields that are not mapped: "
+                         + ", ".join(absent))
+
+    outcomes, reasons = Cut("renewal outcome"), Cut("reason for not renewing")
+    lead_days: list[int] = []
+    rows = no_dates = not_renewed = 0
+    end_col = (cols["contract_end_date"].column_name
+               if "contract_end_date" in cols else None)
+
+    with storage.download(cols["subscription_id"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            rows += 1
+            result = row.get(cols["renewal_outcome"].column_name)
+            outcomes.add(result)
+            # A reason for not renewing only applies where it did not renew.
+            # Counting a blank on a renewed subscription as a missing reason
+            # made nine in ten renewals look like a recording failure.
+            renewed = "renew" in str(result or "").lower() \
+                and "not" not in str(result or "").lower() \
+                and "non" not in str(result or "").lower()
+            if "non_renewal_reason" in cols and not renewed:
+                not_renewed += 1
+                reasons.add(row.get(cols["non_renewal_reason"].column_name))
+            if end_col:
+                settled = a_date(row.get(cols["renewal_date"].column_name))
+                ends = a_date(row.get(end_col))
+                if settled and ends:
+                    lead_days.append((ends - settled).days)
+                else:
+                    no_dates += 1
+    heartbeat(1, 1)
+
+    timing = None
+    if len(lead_days) >= MIN_FOR_A_RATE:
+        v = sorted(lead_days)
+        def at(q): return v[min(int(q * len(v)), len(v) - 1)]
+        timing = {
+            "count": len(v),
+            "days_ahead_middle": at(0.50),
+            "days_ahead_earliest_tenth": at(0.90),
+            "settled_on_or_after_the_end_date": sum(1 for x in v if x <= 0),
+            "settled_on_or_after_the_end_date_share":
+                round(sum(1 for x in v if x <= 0) / len(v), 4),
+        }
+
+    out = {
+        "analysis": "renewal_timing_and_reason",
+        "population": {"subscriptions_read": rows,
+                       "with_no_usable_dates": no_dates},
+        "outcomes": outcomes.as_dict(rows),
+        "timing": timing,
+        "timing_not_measured_because_the_field_is_not_mapped":
+            end_col is None,
+        "rates_suppressed_below": MIN_FOR_A_RATE,
+        "note": "How far ahead of the contract end each renewal was settled. "
+                "A renewal settled on or after the end date was not managed, "
+                "whatever its outcome.",
+    }
+    if "non_renewal_reason" in cols:
+        out["reasons_for_not_renewing"] = reasons.as_dict(not_renewed)
+        out["did_not_renew"] = not_renewed
+        out["non_renewals_with_no_usable_reason"] = reasons.not_answered
+        out["non_renewals_with_no_usable_reason_share"] = (
+            round(reasons.not_answered / not_renewed, 4)
+            if not_renewed >= MIN_FOR_A_RATE else None)
+    return rows, out
+
+
+def a_moment(value):
+    """A date and time, or None. Response time needs the hours."""
+    t = (str(value) if value is not None else "").strip()
+    if not t:
+        return None
+    t = t.replace("T", " ").split("+")[0].split(".")[0].strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+                "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
+                "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(t, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def signal_to_first_contact(conn, engagement_id: str, heartbeat):
+    """When somebody raised a hand, how long before a person answered.
+
+    The signal is a form submission. Not a record being created: a bought
+    list, a ZoomInfo import and a scraped contact all create records, and
+    none of them is a buyer raising a hand. Measuring from record creation
+    measures the import.
+
+    Meetings in the activity log are counted but not treated as signals.
+    A meeting the prospect booked through a scheduling link is as inbound
+    as a form; one a rep booked is not, and nothing in an activity export
+    distinguishes them.
+
+    The response is the first activity of any kind against the same person
+    after the signal. Direction is not needed and mostly is not there:
+    both CRMs carry a direction field, both populate it only when the
+    activity happened inside the tool, and reps logging by hand are offered
+    the choice rather than made to take it.
+    """
+    cols = resolve_columns(conn, engagement_id, "signal_to_first_contact")
+    needed = ["contact_id", "activity_id", "activity_contact_id", "activity_at"]
+    absent = [k for k in needed if k not in cols]
+    if absent:
+        raise ValueError("this analysis needs fields that are not mapped: "
+                         + ", ".join(absent))
+    if "form_submission_at" not in cols or "form_submission_contact_id" not in cols:
+        raise ValueError(
+            "there is no record of anyone raising a hand: no form submissions "
+            "are mapped. Response time cannot be measured without a signal, "
+            "and that is a finding rather than a gap")
+
+    # Everyone in the CRM, so the ones who never signalled can be counted.
+    heartbeat(0, 3)
+    people: set[str] = set()
+    with storage.download(cols["contact_id"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            key = (row.get(cols["contact_id"].column_name) or "").strip()
+            if key:
+                people.add(key)
+    leads = 0
+    if "lead_id" in cols:
+        with storage.download(cols["lead_id"].storage_path).open(
+                "r", encoding="utf-8-sig", newline="") as fh:
+            for row in csv.DictReader(fh):
+                key = (row.get(cols["lead_id"].column_name) or "").strip()
+                if key:
+                    people.add(key)
+                    leads += 1
+    heartbeat(1, 3)
+
+    # The signals.
+    first_signal: dict[str, object] = {}
+    submissions = undated_signals = 0
+    with storage.download(cols["form_submission_at"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            submissions += 1
+            who = (row.get(cols["form_submission_contact_id"].column_name) or "").strip()
+            when = a_moment(row.get(cols["form_submission_at"].column_name))
+            if not who:
+                continue
+            if when is None:
+                undated_signals += 1
+                continue
+            if who not in first_signal or when < first_signal[who]:
+                first_signal[who] = when
+    heartbeat(2, 3)
+
+    # The responses: any activity against that person, after the signal.
+    first_reply: dict[str, object] = {}
+    activities = meetings = 0
+    meeting_col = cols["meeting_at"].column_name if "meeting_at" in cols else None
+    with storage.download(cols["activity_at"].storage_path).open(
+            "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            activities += 1
+            if meeting_col and (row.get(meeting_col) or "").strip():
+                meetings += 1
+            who = (row.get(cols["activity_contact_id"].column_name) or "").strip()
+            if who not in first_signal:
+                continue
+            when = a_moment(row.get(cols["activity_at"].column_name))
+            if when is None or when < first_signal[who]:
+                continue
+            if who not in first_reply or when < first_reply[who]:
+                first_reply[who] = when
+    heartbeat(3, 3)
+
+    hours = sorted((first_reply[w] - first_signal[w]).total_seconds() / 3600
+                   for w in first_reply)
+    signalled = len(first_signal)
+    never_answered = signalled - len(hours)
+
+    def within(h):
+        return sum(1 for x in hours if x <= h)
+
+    bands = None
+    if signalled >= MIN_FOR_A_RATE:
+        bands = [{"answered": "within " + label, "people": within(h),
+                  "of": signalled, "share": round(within(h) / signalled, 4)}
+                 for label, h in (("an hour", 1), ("a working day", 8),
+                                  ("a day", 24), ("three days", 72),
+                                  ("a week", 168))]
+        bands.append({"answered": "not at all", "people": never_answered,
+                      "of": signalled,
+                      "share": round(never_answered / signalled, 4)})
+
+    speed = None
+    if len(hours) >= MIN_FOR_A_RATE:
+        def at(q): return round(hours[min(int(q * len(hours)), len(hours) - 1)], 2)
+        speed = {"answered": len(hours), "quickest_tenth_hours": at(0.10),
+                 "middle_hours": at(0.50), "slowest_tenth_hours": at(0.90)}
+
+    # Only people we can actually see in the CRM. A form submission from
+    # somebody who is not in the contact or lead export is its own small
+    # finding, counted below rather than swelling this one.
+    signalled_and_known = {w for w in first_signal if w in people}
+    never_signalled = len(people) - len(signalled_and_known)
+    signals_from_nobody_on_file = signalled - len(signalled_and_known)
+    return signalled, {
+        "analysis": "signal_to_first_contact",
+        "population": {
+            "people_in_the_crm": len(people),
+            "of_which_unconverted_leads": leads if "lead_id" in cols else None,
+            "form_submissions_read": submissions,
+            "form_submissions_with_no_date": undated_signals,
+            "people_who_signalled": signalled,
+            "activities_read": activities,
+        },
+        "answered_within": bands,
+        "speed": speed,
+        "never_answered": never_answered,
+        # The other finding, and on most CRMs the louder one.
+        "people_who_never_signalled": never_signalled,
+        "people_who_never_signalled_share": (
+            round(never_signalled / len(people), 4)
+            if len(people) >= MIN_FOR_A_RATE else None),
+        "signals_from_somebody_not_in_the_crm": signals_from_nobody_on_file,
+        "meetings_recorded": meetings if meeting_col else None,
+        "leads_not_counted_because_the_export_is_not_mapped":
+            "lead_id" not in cols,
+        "rates_suppressed_below": MIN_FOR_A_RATE,
+        "note": "The signal is a form submission. A record being created is "
+                "not a signal: imported lists create records and raise no "
+                "hands. People in the CRM who never submitted a form are "
+                "counted separately, and on most databases they are most of "
+                "it — which is what every per-contact rate the client quotes "
+                "is computed against.",
+    }
+
+
 # The analyses that read real data. Everything not here is still a fixture,
 # and the database refuses to accept a fixture as evidence.
 BUILT = {
@@ -941,4 +1503,9 @@ BUILT = {
     "stage_conversion_and_duration": stage_conversion_and_duration,
     "cost_per_qualified_opportunity": cost_per_qualified_opportunity,
     "forecast_accuracy": forecast_accuracy,
+    "buying_group_composition": buying_group_composition,
+    "handover_completeness_census": handover_completeness_census,
+    "expansion_vs_new_business": expansion_vs_new_business,
+    "renewal_timing_and_reason": renewal_timing_and_reason,
+    "signal_to_first_contact": signal_to_first_contact,
 }
