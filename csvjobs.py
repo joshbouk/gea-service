@@ -129,6 +129,25 @@ def count_lines(path: Path, encoding: str) -> int:
 
 # ------------------------------------------------------------------ parsing --
 
+# A client export can contain bytes that Postgres will not store. The
+# commonest is NUL (0x00), which Excel and several CRMs emit as padding
+# inside string cells and which a text column cannot hold at all. Reading
+# such a file succeeded all the way to the last row and then failed on the
+# insert, which looked like a service fault and was a cell.
+#
+# Cleaning happens once here, where a value is first read, rather than at
+# each of the places one is later written. The character carries no meaning
+# in exported data and nothing is lost by dropping it.
+_UNSTORABLE = str.maketrans("", "", "\x00")
+
+
+def storable(value: str) -> str:
+    """A value Postgres will accept, with nothing meaningful removed."""
+    if value is None:
+        return value
+    return value.translate(_UNSTORABLE) if "\x00" in value else value
+
+
 @dataclass
 class ColumnStats:
     name: str
@@ -153,7 +172,7 @@ class ColumnStats:
     SAMPLES = 10
 
     def observe(self, value: str) -> None:
-        value = value.strip()
+        value = storable(value).strip()
         if value == "":
             return
         self.populated += 1
@@ -218,7 +237,7 @@ def read_export(path: Path, on_progress=None) -> ParseResult:
         except StopIteration:
             raise ParseError("the file is empty.") from None
 
-        header = [h.strip() for h in header]
+        header = [storable(h).strip() for h in header]
         if not any(header):
             raise ParseError("the first line is blank, so there are no column names.")
 
