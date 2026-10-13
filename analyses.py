@@ -2075,6 +2075,164 @@ def adversarial_score_review(conn, engagement_id: str, heartbeat):
     }
 
 
+def synthesise_interview(conn, engagement_id: str, heartbeat, interview_id=None):
+    """Read a conversation against the questions it was meant to cover.
+
+    Forty minutes of talk, twenty to fifty questions, and a consultant who
+    needs to find the part that bears on element 5.3. That is the whole job.
+
+    It does not propose a score. Nothing here says what an element is worth,
+    and the elements an interview serves are scored by a person who read it.
+    The synthesis exists so they can find what they are looking for.
+
+    Three outputs, and the second two are the ones worth having:
+
+      What was said, per question, in the words that were said. A claim
+      without the words is the model's summary, and a summary cannot be
+      cited.
+
+      What was never discussed. A guide has questions for a reason, and a
+      question nobody asked is a gap in the evidence rather than a silence
+      about the client. Consultants run out of time and skip the last ten
+      minutes; this is what notices.
+
+      Where the answer did not answer. Not a claim that somebody was hiding
+      something — that is a judgement nobody should delegate — but a flag
+      that the words given did not address what was asked, so a person can
+      decide for themselves.
+    """
+    model.check_configured()
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            select i.id, i.interviewee_name, i.interviewee_role,
+                   g.ref, g.function_name, a.storage_path, a.original_filename
+              from interview i
+              join interview_guide g on g.id = i.interview_guide_id
+              left join artefact a on a.id = i.transcript_artefact_id
+                                  and a.purged_at is null
+             where i.engagement_id = %s
+               and (%s::uuid is null or i.id = %s::uuid)
+               and i.status = 'held'
+               and i.synthesis_run_id is null
+             order by i.held_at nulls last
+             limit 1
+        """, (engagement_id, interview_id, interview_id))
+        row = cur.fetchone()
+    conn.rollback()
+
+    if row is None:
+        raise ValueError(
+            "there is no interview waiting to be read. One has to be marked "
+            "held before its transcript can be synthesised")
+    iid, who, role, guide_ref, function_name, path, filename = row
+    if path is None:
+        raise ValueError(
+            f"the {function_name} interview has no transcript attached, so "
+            f"there is nothing to read. Attach it and try again")
+
+    with conn.cursor() as cur:
+        cur.execute("select * from gea_interview_guide_questions(%s)", (iid,))
+        questions = [{"id": r[0], "section": r[1], "text": r[2], "elements": r[3]}
+                     for r in cur.fetchall()]
+    conn.rollback()
+
+    with storage.download(path).open("r", encoding="utf-8",
+                                     errors="replace") as fh:
+        transcript = fh.read()
+    if len(transcript.split()) < 200:
+        raise ValueError(
+            f"that transcript is {len(transcript.split())} words, which is "
+            f"too short to be a conversation. Check the right file is "
+            f"attached")
+
+    # The transcript goes with every batch of questions. It is the thing
+    # being read, and a question judged against part of a conversation is
+    # judged against the wrong thing.
+    LABELS = ["was_asked", "was_answered", "the_answer_addressed_the_question"]
+    records = [{"id": q["id"],
+                "text": (f"QUESTION: {q['text']}\n"
+                         + (f"SECTION: {q['section']}\n" if q["section"] else "")
+                         + "\n--- THE TRANSCRIPT ---\n" + transcript[:60000])}
+               for q in questions]
+
+    labelled, unread = model.classify(
+        records,
+        f"Each record is one question from the {function_name} interview "
+        f"guide, followed by the transcript of that conversation with "
+        f"{who}{', ' + role if role else ''}.\n\n"
+        "For each question, answer:\n"
+        "- was_asked: the question, or something close enough to it, was put "
+        "to the interviewee.\n"
+        "- was_answered: they said something in response.\n"
+        "- the_answer_addressed_the_question: what they said actually bears "
+        "on what was asked. Answer no where they talked about something "
+        "else, gave a generality, or deferred to somebody not present. This "
+        "is not a claim that they were evasive; it is a flag for a person to "
+        "judge.\n\n"
+        "Your evidence quotation must be the interviewee's own words from "
+        "the transcript, under fifteen words, and must be the part that "
+        "answers the question where there is one. Where the question was "
+        "never put, quote nothing and say so with an empty evidence string "
+        "is not permitted — quote the nearest thing that was discussed "
+        "instead.\n\n"
+        "Never say what any of this is worth. You are not scoring anything.",
+        LABELS, heartbeat=heartbeat)
+
+    by_id = {q["id"]: q for q in questions}
+    covered, never_asked, not_addressed = [], [], []
+    for qid, v in labelled.items():
+        q = by_id[qid]
+        entry = {"question": q["text"], "elements": q["elements"],
+                 "said": v["evidence"], "confidence": v["confidence"]}
+        if v["labels"]["was_asked"] == "no":
+            never_asked.append({"question": q["text"],
+                                "elements": q["elements"]})
+        elif v["labels"]["the_answer_addressed_the_question"] == "no":
+            not_addressed.append(entry)
+        elif v["labels"]["was_answered"] == "yes":
+            covered.append(entry)
+
+    # Which elements this conversation actually reached. An element whose
+    # every question went unasked is not evidenced by this interview, and
+    # saying so is the difference between a gap somebody can close and one
+    # nobody notices until the scoring.
+    reached, missed = set(), set()
+    for q in questions:
+        for e in q["elements"]:
+            if any(x["question"] == q["text"] for x in covered):
+                reached.add(e)
+    for q in questions:
+        for e in q["elements"]:
+            if e not in reached:
+                missed.add(e)
+
+    return len(covered), {
+        "analysis": "synthesise_interview",
+        "interview": {"guide": guide_ref, "function": function_name,
+                      "interviewee": who, "role": role,
+                      "transcript": filename,
+                      "words": len(transcript.split())},
+        "population": {
+            "questions_in_the_guide": len(questions),
+            "questions_read": len(labelled),
+            "questions_the_model_did_not_return": len(unread),
+        },
+        "what_was_said": covered,
+        "never_asked": never_asked,
+        "asked_but_not_addressed": not_addressed,
+        "elements_this_conversation_reached": sorted(reached),
+        "elements_it_did_not": sorted(missed),
+        "complete": not unread,
+        "model": model.MODEL,
+        "note": "Nothing here is a score. It is what was said, against the "
+                "questions the guide asks, in the words that were said. A "
+                "question nobody put is a gap in the evidence, not a silence "
+                "about the client. An answer flagged as not addressing the "
+                "question is for a person to judge, not an accusation.",
+    }
+
+
 # What each analysis actually reads.
 #
 # Three analyses have now been built needing a field they never declared, and
@@ -2175,4 +2333,5 @@ BUILT = {
     "note_sufficiency": note_sufficiency,
     "discovery_consistency_classification": discovery_consistency_classification,
     "adversarial_score_review": adversarial_score_review,
+    "synthesise_interview": synthesise_interview,
 }

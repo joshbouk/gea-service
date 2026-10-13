@@ -63,6 +63,29 @@ RECONNECT_MAX = 30
 running = True
 
 
+def describe(output: dict) -> str:
+    """One line about what a run found, in its own terms.
+
+    Every analysis counts something different, and a worker log that reads
+    "352 of 1,216 closed-won described" after an interview synthesis is
+    worse than no log.
+    """
+    p = output.get("population", {})
+    if "closed_won" in p and "described" in p:
+        return f"{p['described']:,} of {p['closed_won']:,} closed-won described"
+    if "questions_in_the_guide" in p:
+        return (f"{p['questions_read']} of {p['questions_in_the_guide']} "
+                f"questions read")
+    if "elements_scored" in p:
+        return (f"{len(output.get('challenges', []))} challenges against "
+                f"{p['elements_scored']} scores")
+    if "records_classified" in p:
+        return f"{p['records_classified']:,} records classified"
+    first = next((f"{k.replace('_', ' ')} {v:,}" for k, v in p.items()
+                  if isinstance(v, int)), "done")
+    return first
+
+
 def log(message: str) -> None:
     print(f"{datetime.now(timezone.utc).strftime('%H:%M:%S')}  {message}", flush=True)
 
@@ -254,9 +277,9 @@ def work_one(conn: psycopg.Connection) -> bool:
     # Analyses that have been built read the client's own data. The rest
     # still return fixture output and say so by leaving model_name 'stub',
     # which the database refuses to accept as evidence.
-    if job_type.startswith("analysis:") and \
-            job_type.split(":", 1)[1] in analyses.BUILT:
-        key = job_type.split(":", 1)[1]
+    key = (job_type.split(":", 1)[1] if job_type.startswith("analysis:")
+           else job_type)
+    if key in analyses.BUILT:
         with conn.cursor() as cur:
             cur.execute("select engagement_id from analysis_run where id = %s",
                         (run_id,))
@@ -281,9 +304,7 @@ def work_one(conn: psycopg.Connection) -> bool:
                 "model_name=%s where id=%s",
                 (total, total, json.dumps(output), analyses.VERSION, run_id))
         conn.commit()
-        p = output["population"]
-        log(f"succeeded {job_type}  {p['described']:,} of "
-            f"{p['closed_won']:,} closed-won described")
+        log(f"succeeded {job_type}  {describe(output)}")
         return True
 
     try:
