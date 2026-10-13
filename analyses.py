@@ -65,6 +65,13 @@ def resolve_columns(conn, engagement_id: str, analysis_key: str) -> dict[str, Co
     Only confirmed mappings. A proposal nobody accepted is not a field the
     client has, and reading one would mean computing a figure from a column
     a person never agreed to.
+
+    The export reference is looked up where it can be, and left empty where
+    it cannot. It is used for reporting and nothing else, and requiring it
+    made a confirmed mapping invisible the moment its file lost its link to
+    the export line — which is exactly what replacing a file does. The
+    screen went on showing the field as mapped while the analysis reported
+    it missing, and both were reading the truth they had.
     """
     with conn.cursor() as cur:
         cur.execute("""
@@ -78,12 +85,64 @@ def resolve_columns(conn, engagement_id: str, analysis_key: str) -> dict[str, Co
                                   and m.status in ('confirmed','corrected','auto_accepted')
               join dataset d on d.id = m.dataset_id
               join artefact a on a.id = d.artefact_id and a.purged_at is null
-              join export_request_line erl on erl.id = a.export_request_line_id
-              join export_line el on el.id = erl.export_line_id
+              left join export_request_line erl on erl.id = a.export_request_line_id
+              left join export_line el on el.id = erl.export_line_id
              where r.analysis_key = %s
         """, (engagement_id, analysis_key))
-        return {k: Column(k, name, path, ref)
+        return {k: Column(k, name, path, ref or "")
                 for k, name, path, ref in cur.fetchall()}
+
+
+def missing_fields(conn, engagement_id: str, analysis_key: str,
+                   needed: list[str], cols: dict) -> str | None:
+    """Why an analysis cannot run, told apart properly.
+
+    A field can be absent for two reasons that look identical from here and
+    need completely different work. Either nobody mapped it, or the
+    engagement is pinned to an instrument version that never asked for it —
+    and the second happens whenever the methodology gains a field after an
+    engagement starts, which it has done four times.
+
+    Saying "not mapped" in the second case sends somebody to a screen where
+    the field is already mapped, or is not listed at all. Both are a waste
+    of their afternoon.
+    """
+    absent = [k for k in needed if k not in cols]
+    if not absent:
+        return None
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            select cf.key
+              from analysis_field_requirement r
+              join engagement e on e.id = %s
+                               and e.instrument_version_id = r.instrument_version_id
+              join canonical_field cf on cf.id = r.canonical_field_id
+             where r.analysis_key = %s and cf.key = any(%s)
+        """, (engagement_id, analysis_key, absent))
+        declared = {row[0] for row in cur.fetchall()}
+        cur.execute("""
+            select iv.label from engagement e
+              join instrument_version iv on iv.id = e.instrument_version_id
+             where e.id = %s""", (engagement_id,))
+        version = cur.fetchone()[0]
+    conn.rollback()
+
+    unmapped = sorted(k for k in absent if k in declared)
+    undeclared = sorted(k for k in absent if k not in declared)
+
+    parts = []
+    if unmapped:
+        parts.append("this analysis needs fields that are not mapped: "
+                     + ", ".join(unmapped))
+    if undeclared:
+        parts.append(
+            f"this engagement runs on instrument {version}, which does not "
+            f"ask for {', '.join(undeclared)}. The analysis was built against "
+            f"a later version. Start a new engagement on the current "
+            f"instrument, or the figures would be computed from fields this "
+            f"one never required")
+    return ". ".join(parts)
 
 
 def _band(value: str | None, edges: list[tuple[int, str]]) -> str | None:
@@ -253,18 +312,64 @@ def money(value) -> float | None:
         return None
 
 
-WON = ("won", "closed won", "closedwon", "closed-won")
-LOST = ("lost", "closed lost", "closedlost", "closed-lost", "closed/lost")
+# A list of exact stage names cannot survive contact with a real CRM.
+# "6 - Closed Won", "Closed Won (Implemented)", "Closed Lost to Competitor"
+# are all ordinary and none of them matches a fixed string. So the word is
+# looked for inside the stage rather than compared to it.
+#
+# Lost is checked first, because a stage can mention both — "Closed Lost,
+# Won by Competitor" is not a win.
+NOT_A_WIN = ("not won", "no decision", "never won", "not closed won")
 
 
 def outcome(value) -> str | None:
     """Won, lost, or neither. Neither is open, and open is not a loss."""
-    t = (str(value) if value is not None else "").strip().lower()
-    if t in WON:
-        return "won"
-    if t in LOST:
+    t = " ".join(str(value or "").strip().lower().split())
+    if not t:
+        return None
+    if any(n in t for n in NOT_A_WIN):
+        return "lost" if "lost" in t else None
+    if "lost" in t:
         return "lost"
+    if "won" in t or t == "win":
+        return "won"
     return None
+
+
+@dataclass
+class Outcomes:
+    """What the stage column actually contained.
+
+    An analysis that classified nothing has not found that the client never
+    won a deal. It has found that it cannot read their stage names, and the
+    difference is the whole difference between a finding and a bug. So what
+    was seen is kept, and reported when nothing matched.
+    """
+    seen: Counter = field(default_factory=Counter)
+
+    def classify(self, value) -> str | None:
+        result = outcome(value)
+        self.seen[(str(value or "").strip() or "(empty)", result or "neither")] += 1
+        return result
+
+    @property
+    def classified(self) -> int:
+        return sum(n for (_v, r), n in self.seen.items() if r != "neither")
+
+    def refuse_if_nothing_matched(self, column: str) -> None:
+        if self.classified:
+            return
+        top = ", ".join(f"{v!r} ({n})" for (v, _r), n in self.seen.most_common(8))
+        raise ValueError(
+            f"none of the values in {column} could be read as won or lost, so "
+            f"there is nothing to measure. What is in that column: {top}. "
+            f"Either the wrong column is mapped, or this client records "
+            f"outcomes in words that need adding to the methodology.")
+
+    def as_dict(self) -> dict:
+        return {"stage_values_seen": [
+            {"value": v, "read_as": r, "deals": n}
+            for (v, r), n in self.seen.most_common(20)]}
 
 
 def icp_reconciliation(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
@@ -282,16 +387,16 @@ def icp_reconciliation(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
     needed = ["opportunity_account_id", "opportunity_status", "account_id",
               "account_industry", "account_country", "account_employee_count",
               "account_annual_revenue"]
-    absent = [k for k in needed if k not in cols]
-    if absent:
-        raise ValueError(
-            "this analysis needs fields that are not mapped: "
-            + ", ".join(absent))
+    problem = missing_fields(conn, engagement_id, "icp_reconciliation",
+                             needed, cols)
+    if problem:
+        raise ValueError(problem)
 
     deals_path = cols["opportunity_status"].storage_path
     accounts_path = cols["account_id"].storage_path
 
     # The companies file first: a lookup from account to its firmographics.
+    seen = Outcomes()
     heartbeat(0, 2)
     accounts = load_accounts(cols)
     heartbeat(1, 2)
@@ -311,7 +416,7 @@ def icp_reconciliation(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
                                            newline="") as fh:
         for row in csv.DictReader(fh):
             deals += 1
-            if outcome(row.get(status_col)) != "won":
+            if seen.classify(row.get(status_col)) != "won":
                 continue
             won_deals += 1
 
@@ -327,6 +432,7 @@ def icp_reconciliation(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
             add_firmographics(cuts, acct)
     heartbeat(2, 2)
 
+    seen.refuse_if_nothing_matched(cols["opportunity_status"].column_name)
     described = won_deals - no_account - unmatched
     gaps = []
     if no_account:
@@ -344,6 +450,7 @@ def icp_reconciliation(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
             "described": described,
             "accounts_in_the_companies_export": len(accounts),
         },
+        **seen.as_dict(),
         "cuts": [c.as_dict(described) for c in cuts.values()],
         "not_cut_because_the_field_is_not_mapped": not_cut,
         "gaps": [g.as_dict() for g in gaps],
@@ -376,11 +483,11 @@ def win_loss_and_churn_patterns(conn, engagement_id: str, heartbeat):
     needed = ["opportunity_id", "opportunity_status", "opportunity_account_id",
               "loss_reason", "account_id", "account_industry",
               "account_employee_count"]
-    absent = [k for k in needed if k not in cols]
-    if absent:
-        raise ValueError("this analysis needs fields that are not mapped: "
-                         + ", ".join(absent))
+    problem = missing_fields(conn, engagement_id, "win_loss_and_churn_patterns", needed, cols)
+    if problem:
+        raise ValueError(problem)
 
+    seen = Outcomes()
     heartbeat(0, 2)
     accounts = load_accounts(cols)
     heartbeat(1, 2)
@@ -397,7 +504,7 @@ def win_loss_and_churn_patterns(conn, engagement_id: str, heartbeat):
             "r", encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
             deals += 1
-            result = outcome(row.get(status_col))
+            result = seen.classify(row.get(status_col))
             if result is None:
                 open_deals += 1
                 continue
@@ -422,6 +529,7 @@ def win_loss_and_churn_patterns(conn, engagement_id: str, heartbeat):
             add_firmographics(won_cuts if result == "won" else lost_cuts, acct)
     heartbeat(2, 2)
 
+    seen.refuse_if_nothing_matched(cols["opportunity_status"].column_name)
     decided = won + lost
     overall = round(won / decided, 4) if decided >= MIN_FOR_A_RATE else None
 
@@ -439,7 +547,8 @@ def win_loss_and_churn_patterns(conn, engagement_id: str, heartbeat):
             variance.append({
                 "dimension": name, "value": value,
                 "won": n_won, "lost": n_lost, "of": total,
-                "win_rate": round(rate, 4),
+                **seen.as_dict(),
+        "win_rate": round(rate, 4),
                 "points_from_overall": (round((rate - overall) * 100, 1)
                                         if overall is not None else None),
             })
@@ -499,10 +608,9 @@ def price_discount_dispersion(conn, engagement_id: str, heartbeat):
     cols = resolve_columns(conn, engagement_id, "price_discount_dispersion")
     needed = ["opportunity_id", "opportunity_status", "opportunity_list_price",
               "opportunity_realised_price"]
-    absent = [k for k in needed if k not in cols]
-    if absent:
-        raise ValueError("this analysis needs fields that are not mapped: "
-                         + ", ".join(absent))
+    problem = missing_fields(conn, engagement_id, "price_discount_dispersion", needed, cols)
+    if problem:
+        raise ValueError(problem)
 
     accounts = load_accounts(cols) if "account_id" in cols else {}
     discounts: list[float] = []
@@ -515,10 +623,11 @@ def price_discount_dispersion(conn, engagement_id: str, heartbeat):
     list_col = cols["opportunity_list_price"].column_name
     real_col = cols["opportunity_realised_price"].column_name
 
+    seen = Outcomes()
     with storage.download(cols["opportunity_status"].storage_path).open(
             "r", encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
-            if outcome(row.get(status_col)) != "won":
+            if seen.classify(row.get(status_col)) != "won":
                 continue
             won += 1
             lst, real = money(row.get(list_col)), money(row.get(real_col))
@@ -544,6 +653,7 @@ def price_discount_dispersion(conn, engagement_id: str, heartbeat):
                     by_segment[(acct.get("segment") or "not recorded")].append(d)
     heartbeat(1, 1)
 
+    seen.refuse_if_nothing_matched(cols["opportunity_status"].column_name)
     def spread(values: list[float]) -> dict | None:
         if len(values) < MIN_FOR_A_RATE:
             return {"count": len(values), "suppressed": True}
@@ -574,6 +684,7 @@ def price_discount_dispersion(conn, engagement_id: str, heartbeat):
         "no_list_price_structure": (
             len(discounts) >= MIN_FOR_A_RATE
             and (same_as_list / len(discounts)) >= 0.95),
+        **seen.as_dict(),
         "discount": spread(discounts),
         "by_segment": ({k: spread(v) for k, v in sorted(by_segment.items())}
                        if by_segment else None),
@@ -640,10 +751,9 @@ def stage_conversion_and_duration(conn, engagement_id: str, heartbeat):
     needed = ["opportunity_id", "opportunity_status",
               "stage_history_opportunity_id", "stage_history_to",
               "stage_entered_at"]
-    absent = [k for k in needed if k not in cols]
-    if absent:
-        raise ValueError("this analysis needs fields that are not mapped: "
-                         + ", ".join(absent))
+    problem = missing_fields(conn, engagement_id, "stage_conversion_and_duration", needed, cols)
+    if problem:
+        raise ValueError(problem)
 
     # The outcome of each deal, from the deals export.
     heartbeat(0, 2)
@@ -777,10 +887,9 @@ def cost_per_qualified_opportunity(conn, engagement_id: str, heartbeat):
     cols = resolve_columns(conn, engagement_id, "cost_per_qualified_opportunity")
     needed = ["opportunity_id", "channel_source", "qualified_at",
               "spend_amount", "spend_channel", "spend_month"]
-    absent = [k for k in needed if k not in cols]
-    if absent:
-        raise ValueError("this analysis needs fields that are not mapped: "
-                         + ", ".join(absent))
+    problem = missing_fields(conn, engagement_id, "cost_per_qualified_opportunity", needed, cols)
+    if problem:
+        raise ValueError(problem)
 
     heartbeat(0, 2)
     spend: dict[tuple[str, str], float] = defaultdict(float)
@@ -875,10 +984,9 @@ def forecast_accuracy(conn, engagement_id: str, heartbeat):
     """
     cols = resolve_columns(conn, engagement_id, "forecast_accuracy")
     needed = ["forecast_period", "forecast_amount", "forecast_actual_amount"]
-    absent = [k for k in needed if k not in cols]
-    if absent:
-        raise ValueError("this analysis needs fields that are not mapped: "
-                         + ", ".join(absent))
+    problem = missing_fields(conn, engagement_id, "forecast_accuracy", needed, cols)
+    if problem:
+        raise ValueError(problem)
 
     periods: dict[str, dict] = {}
     rows = unusable = 0
@@ -944,10 +1052,9 @@ def buying_group_composition(conn, engagement_id: str, heartbeat):
     cols = resolve_columns(conn, engagement_id, "buying_group_composition")
     needed = ["opportunity_id", "opportunity_status", "contact_role",
               "contact_role_opportunity_id", "contact_role_contact_id"]
-    absent = [k for k in needed if k not in cols]
-    if absent:
-        raise ValueError("this analysis needs fields that are not mapped: "
-                         + ", ".join(absent))
+    problem = missing_fields(conn, engagement_id, "buying_group_composition", needed, cols)
+    if problem:
+        raise ValueError(problem)
 
     heartbeat(0, 3)
     outcomes = {}
@@ -1056,23 +1163,24 @@ def handover_completeness_census(conn, engagement_id: str, heartbeat):
     needed = ["opportunity_id", "opportunity_status", "opportunity_account_id",
               "contact_role", "contact_role_opportunity_id",
               "activity_id", "activity_opportunity_id", "activity_type"]
-    absent = [k for k in needed if k not in cols]
-    if absent:
-        raise ValueError("this analysis needs fields that are not mapped: "
-                         + ", ".join(absent))
+    problem = missing_fields(conn, engagement_id, "handover_completeness_census", needed, cols)
+    if problem:
+        raise ValueError(problem)
 
+    seen = Outcomes()
     heartbeat(0, 4)
     won_deals: dict[str, str] = {}
     with storage.download(cols["opportunity_id"].storage_path).open(
             "r", encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
-            if outcome(row.get(cols["opportunity_status"].column_name)) != "won":
+            if seen.classify(row.get(cols["opportunity_status"].column_name)) != "won":
                 continue
             key = (row.get(cols["opportunity_id"].column_name) or "").strip()
             if key:
                 won_deals[key] = (row.get(cols["opportunity_account_id"].column_name) or "").strip()
     heartbeat(1, 4)
 
+    seen.refuse_if_nothing_matched(cols["opportunity_status"].column_name)
     has_role = set()
     with storage.download(cols["contact_role"].storage_path).open(
             "r", encoding="utf-8-sig", newline="") as fh:
@@ -1139,6 +1247,7 @@ def handover_completeness_census(conn, engagement_id: str, heartbeat):
     return n, {
         "analysis": "handover_completeness_census",
         "population": {"closed_won": n, "checks_made": len(checks)},
+        **seen.as_dict(),
         "each_part": present,
         "deals_with_every_part": len(complete),
         "deals_with_every_part_share": (round(len(complete) / n, 4)
@@ -1172,21 +1281,21 @@ def expansion_vs_new_business(conn, engagement_id: str, heartbeat):
     cols = resolve_columns(conn, engagement_id, "expansion_vs_new_business")
     needed = ["opportunity_id", "opportunity_status", "opportunity_type",
               "opportunity_account_id"]
-    absent = [k for k in needed if k not in cols]
-    if absent:
-        raise ValueError("this analysis needs fields that are not mapped: "
-                         + ", ".join(absent))
+    problem = missing_fields(conn, engagement_id, "expansion_vs_new_business", needed, cols)
+    if problem:
+        raise ValueError(problem)
 
     types = Cut("opportunity type")
     won = unclassified = read = 0
     by_type: Counter = Counter()
     accounts_won: dict[str, set] = defaultdict(set)
 
+    seen = Outcomes()
     with storage.download(cols["opportunity_id"].storage_path).open(
             "r", encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
             read += 1
-            if outcome(row.get(cols["opportunity_status"].column_name)) != "won":
+            if seen.classify(row.get(cols["opportunity_status"].column_name)) != "won":
                 continue
             won += 1
             raw = row.get(cols["opportunity_type"].column_name)
@@ -1202,6 +1311,7 @@ def expansion_vs_new_business(conn, engagement_id: str, heartbeat):
                 accounts_won[label].add(acct)
     heartbeat(1, 2)
 
+    seen.refuse_if_nothing_matched(cols["opportunity_status"].column_name)
     # What those customers are worth, from the subscriptions.
     recurring = expansion = 0.0
     subs = subs_unpriced = 0
@@ -1229,6 +1339,7 @@ def expansion_vs_new_business(conn, engagement_id: str, heartbeat):
             "subscriptions_read": subs,
             "subscriptions_with_no_recurring_revenue": subs_unpriced,
         },
+        **seen.as_dict(),
         "won_by_type": types.as_dict(won),
         "accounts_by_type": [{"type": k, "accounts": len(v)}
                              for k, v in sorted(accounts_won.items())],
@@ -1256,10 +1367,9 @@ def renewal_timing_and_reason(conn, engagement_id: str, heartbeat):
     """
     cols = resolve_columns(conn, engagement_id, "renewal_timing_and_reason")
     needed = ["subscription_id", "renewal_date", "renewal_outcome"]
-    absent = [k for k in needed if k not in cols]
-    if absent:
-        raise ValueError("this analysis needs fields that are not mapped: "
-                         + ", ".join(absent))
+    problem = missing_fields(conn, engagement_id, "renewal_timing_and_reason", needed, cols)
+    if problem:
+        raise ValueError(problem)
 
     outcomes, reasons = Cut("renewal outcome"), Cut("reason for not renewing")
     lead_days: list[int] = []
@@ -1364,10 +1474,9 @@ def signal_to_first_contact(conn, engagement_id: str, heartbeat):
     """
     cols = resolve_columns(conn, engagement_id, "signal_to_first_contact")
     needed = ["contact_id", "activity_id", "activity_contact_id", "activity_at"]
-    absent = [k for k in needed if k not in cols]
-    if absent:
-        raise ValueError("this analysis needs fields that are not mapped: "
-                         + ", ".join(absent))
+    problem = missing_fields(conn, engagement_id, "signal_to_first_contact", needed, cols)
+    if problem:
+        raise ValueError(problem)
     if "form_submission_at" not in cols or "form_submission_contact_id" not in cols:
         raise ValueError(
             "there is no record of anyone raising a hand: no form submissions "
@@ -1534,24 +1643,25 @@ def note_sufficiency(conn, engagement_id: str, heartbeat):
     cols = resolve_columns(conn, engagement_id, "note_sufficiency")
     needed = ["note_id", "note_body", "note_author", "note_created_at",
               "note_opportunity_id", "meeting_at"]
-    absent = [k for k in needed if k not in cols]
-    if absent:
-        raise ValueError("this analysis needs fields that are not mapped: "
-                         + ", ".join(absent))
+    problem = missing_fields(conn, engagement_id, "note_sufficiency", needed, cols)
+    if problem:
+        raise ValueError(problem)
 
     model.check_configured()
 
     # Which opportunities closed, and which way.
+    seen = Outcomes()
     heartbeat(0, 3)
     closed: dict[str, str] = {}
     if "opportunity_id" in cols and "opportunity_status" in cols:
         with storage.download(cols["opportunity_id"].storage_path).open(
                 "r", encoding="utf-8-sig", newline="") as fh:
             for row in csv.DictReader(fh):
-                result = outcome(row.get(cols["opportunity_status"].column_name))
+                result = seen.classify(row.get(cols["opportunity_status"].column_name))
                 key = (row.get(cols["opportunity_id"].column_name) or "").strip()
                 if key and result:
                     closed[key] = result
+    seen.refuse_if_nothing_matched(cols["opportunity_status"].column_name)
     heartbeat(1, 3)
 
     notes: list[dict] = []
@@ -1714,10 +1824,9 @@ def discovery_consistency_classification(conn, engagement_id: str, heartbeat):
                            "discovery_consistency_classification")
     needed = ["note_id", "note_body", "note_author", "note_created_at",
               "note_opportunity_id", "activity_owner"]
-    absent = [k for k in needed if k not in cols]
-    if absent:
-        raise ValueError("this analysis needs fields that are not mapped: "
-                         + ", ".join(absent))
+    problem = missing_fields(conn, engagement_id, "discovery_consistency_classification", needed, cols)
+    if problem:
+        raise ValueError(problem)
 
     model.check_configured()
 
