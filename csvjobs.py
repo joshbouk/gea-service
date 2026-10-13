@@ -221,8 +221,119 @@ class ParseResult:
     date_max: date | None
 
 
+# What a file actually is, read from its first bytes rather than its name.
+#
+# A spreadsheet renamed .csv is common, and so is a .xlsx uploaded as the
+# export it is. Reading either as text produces one enormous column of
+# compressed rubbish, a mapping screen offering it as a candidate, and a
+# failure several steps later that names none of this.
+MAGIC = [
+    (b"PK\x03\x04", "xlsx"),      # any zip: xlsx, and also docx and pptx
+    (b"\xd0\xcf\x11\xe0", "xls"),  # the old binary Excel format
+    (b"%PDF", "pdf"),
+]
+
+
+def what_is_this(path: Path) -> str:
+    head = path.read_bytes()[:8]
+    for magic, kind in MAGIC:
+        if head.startswith(magic):
+            return kind
+    return "text"
+
+
+def read_workbook(path: Path, on_progress=None) -> ParseResult:
+    """Read the first worksheet of an xlsx, row by row.
+
+    Read-only and streamed, because a client's opportunity export runs to
+    tens of thousands of rows and loading one into memory to count it is
+    a waste of a laptop.
+    """
+    import xlsx
+
+    try:
+        rows_iter = xlsx.rows(path, on_progress)
+        raw_header = next(rows_iter)
+    except xlsx.NotAWorkbook as exc:
+        raise ParseError(str(exc)) from None
+    except StopIteration:
+        raise ParseError("the workbook's first sheet is empty.") from None
+    except Exception as exc:
+        raise ParseError(
+            f"that file could not be read as a workbook: {exc}") from None
+
+    header = [storable(h).strip() for h in raw_header]
+    while header and header[-1] == "":
+        header.pop()
+    if not any(header):
+        raise ParseError(
+            "the first row of the sheet is blank, so there are no column "
+            "names. Export it without a title row above the headings.")
+
+    seen: Counter = Counter()
+    names: list[str] = []
+    for i, name in enumerate(header):
+        name = name or f"(unnamed column {i + 1})"
+        seen[name] += 1
+        names.append(name if seen[name] == 1 else f"{name} ({seen[name]})")
+
+    columns = [ColumnStats(n) for n in names]
+    by_name = {c.name: c for c in columns}
+    rows = malformed = 0
+    malformed_examples: list[dict] = []
+
+    for values in rows_iter:
+        if not any(v for v in values):
+            continue
+        rows += 1
+        if len(values) > len(names):
+            malformed += 1
+            if len(malformed_examples) < 5:
+                malformed_examples.append(
+                    {"row": rows + 1, "found": len(values),
+                     "expected": len(names)})
+        for name, value in zip(names, values):
+            by_name[name].observe(value)
+
+    if rows == 0:
+        raise ParseError("the sheet has column names and no rows.")
+
+    # Same rule as the text path: the date-like column covering the most
+    # rows, and nothing invented where none does.
+    dated = [c for c in columns
+             if c.populated > 0 and c.date_like / c.populated > 0.9
+             and c.date_like > 0]
+    primary = max(dated, key=lambda c: c.date_like, default=None)
+
+    return ParseResult(
+        row_count=rows,
+        column_count=len(names),
+        malformed_rows=malformed,
+        malformed_examples=malformed_examples,
+        columns=columns,
+        encoding="xlsx",
+        delimiter="",
+        primary_date_field=primary.name if primary else None,
+        date_min=primary.earliest if primary else None,
+        date_max=primary.latest if primary else None,
+    )
+
+
 def read_export(path: Path, on_progress=None) -> ParseResult:
     """Stream the file once, counting everything worth counting."""
+    kind = what_is_this(path)
+    if kind == "xlsx":
+        return read_workbook(path, on_progress)
+    if kind == "xls":
+        raise ParseError(
+            "this is an Excel file in the old binary format, which the "
+            "service cannot read. Open it in Excel and save it as .xlsx or "
+            "as CSV.")
+    if kind == "pdf":
+        raise ParseError(
+            "this is a PDF. An export has to be a spreadsheet or a CSV; a "
+            "PDF of a report cannot be read field by field.")
+
     encoding, delimiter = sniff(path)
     lines = count_lines(path, encoding)
 
