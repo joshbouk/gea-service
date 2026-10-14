@@ -50,12 +50,16 @@ def parse_export(conn, run_id: str, engagement_id: str, artefact_ids: list[str],
     # is true.
     local = storage.download(storage_path)
 
+    # The local copy is deleted at the end rather than here, because the
+    # rows are read from it a second time further down. It used to go the
+    # moment profiling finished, which is why the first attempt at storing
+    # rows found no file.
     try:
         result = csvjobs.read_export(
             local, on_progress=lambda rows, total: heartbeat(rows, total))
-    finally:
-        # Never leave a copy of a client's CRM on disk.
+    except Exception:
         Path(local).unlink(missing_ok=True)
+        raise
 
     profiles = [csvjobs.profile_column(c, result.row_count) for c in result.columns]
 
@@ -107,10 +111,37 @@ def parse_export(conn, run_id: str, engagement_id: str, artefact_ids: list[str],
               p["flags"], [v[:200] for v in p["sample_values"]])
              for p in profiles])
 
+        # The rows themselves. Everything that used to need the file —
+        # joining two exports, identifying what a file is from its values,
+        # drilling from a figure to the deals behind it — becomes a query
+        # once they are here.
+        #
+        # Written in batches because a single statement holding a hundred
+        # thousand rows is a statement nobody can interrupt.
+        cur.execute("delete from dataset_row where dataset_id = %s",
+                    (dataset_id,))
+        batch, n = [], 0
+        for number, row in enumerate(csvjobs.rows_of(local, result), 1):
+            batch.append((dataset_id, number, json.dumps(row)))
+            if len(batch) >= 2000:
+                cur.executemany(
+                    "insert into dataset_row (dataset_id, row_number, data) "
+                    "values (%s, %s, %s::jsonb)", batch)
+                n += len(batch)
+                batch = []
+        if batch:
+            cur.executemany(
+                "insert into dataset_row (dataset_id, row_number, data) "
+                "values (%s, %s, %s::jsonb)", batch)
+            n += len(batch)
+
         cur.execute(
             "update artefact set row_count = %s, column_count = %s where id = %s",
             (result.row_count, result.column_count, artefact_id))
     conn.commit()
+
+    # Never leave a copy of a client's CRM on disk.
+    Path(local).unlink(missing_ok=True)
 
     # Reading a file is only ever the first half. Uploading is the decision a
     # person makes; proposing the mappings is the consequence, and it should
@@ -226,11 +257,27 @@ def propose_mappings(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
         if str(fid) in settled:
             skipped += 1
             continue
-        # Only look in the exports this field comes from. A loss reason lives
-        # in the deals file and is never matched against a contact export.
-        candidates = [c for ref in (refs or []) for c in by_export.get(ref, [])]
+        # The exports this field comes from first, and then everything
+        # else.
+        #
+        # Scoping to the field's own export was right as far as it went and
+        # went too far: a deals export carrying associated company columns
+        # could never serve account_id, because the file was uploaded
+        # against T1-01 and account_id comes from T1-02. Those columns were
+        # invisible for ever.
+        #
+        # So every column is a candidate, and the ones from the right file
+        # win ties. A column in the file a field belongs to is more likely
+        # to be that field than an identically named column somewhere else,
+        # which is what keeps Created Date in the deals export away from
+        # account_created_at.
+        own = [c for ref in (refs or []) for c in by_export.get(ref, [])]
+        own_names = {id(c) for c in own}
+        elsewhere = [c for c in columns if id(c) not in own_names]
+        candidates = own + elsewhere
         proposals.append(mapping.propose(
-            key, description, expected, cap_bearing, str(fid), candidates))
+            key, description, expected, cap_bearing, str(fid), candidates,
+            own_exports=set(refs or [])))
         if i % 10 == 0:
             heartbeat(i, len(fields))
 

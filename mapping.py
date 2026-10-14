@@ -43,6 +43,17 @@ HIGH, MEDIUM, MEDIUM_LOW, FLOOR = 0.92, 0.75, 0.55, 0.75
 RESEARCH_FLOOR = 0.40
 
 
+# Words that say where a column points rather than what it holds.
+#
+# HubSpot names a lookup "Associated Company ID" and Salesforce writes
+# "Account: Account Name" on a report. Counted as words, they drag a
+# correct match below the floor: account_industry against "Associated
+# Company Industry" scores 0.67 on three tokens against two, and the
+# match is exact once the word that means nothing is gone.
+LOOKUP_NOISE = {"associated", "associate", "related", "parent", "primary",
+                "lookup", "linked"}
+
+
 def normalise(name: str) -> str:
     """Strip a column name back to its words.
 
@@ -86,6 +97,39 @@ ENTITIES = {"opportunity", "account", "contact", "subscription", "deal",
             "company", "line", "item", "activity", "note", "form", "forecast",
             "stage", "history"}
 
+# The same thing under two names, because two CRMs named it differently.
+#
+# HubSpot says Deal and Company where Salesforce says Opportunity and
+# Account, and the canonical keys had to pick one. Without this, every
+# HubSpot export matches badly for a reason that has nothing to do with the
+# client's data: "Deal Stage" and opportunity_status share no word at all.
+#
+# Only words that are genuinely interchangeable in a CRM. A near-synonym
+# here would auto-accept a wrong column, which is the one mistake this
+# matcher must not make.
+SAME_THING = {
+    "deal": "opportunity",
+    "deals": "opportunity",
+    "opp": "opportunity",
+    "opportunities": "opportunity",
+    "company": "account",
+    "companies": "account",
+    "organisation": "account",
+    "organization": "account",
+    "org": "account",
+    "stage": "status",
+    "person": "contact",
+    "people": "contact",
+    "engagement": "activity",
+    "engagements": "activity",
+    "amount": "value",
+    "revenue": "value",
+}
+
+
+def canonicalise(word: str) -> str:
+    return SAME_THING.get(word, word)
+
 # Words that say what kind of thing a field is rather than which thing. Every
 # entity in a CRM has a name, an id, a type and an owner, so these only mean
 # something while their entity is still attached. Dropping "account" from
@@ -96,7 +140,7 @@ STRUCTURAL = {"name", "id", "type", "owner", "date", "status", "code", "count",
               "updated", "at", "by"}
 
 
-def similarity(canonical: str, column: str) -> float:
+def similarity(canonical: str, column: str, drop_entity: bool = True) -> float:
     """How alike two names are, from 0 to 1.
 
     Canonical keys name the entity as well as the field — opportunity_close_date
@@ -104,7 +148,19 @@ def similarity(canonical: str, column: str) -> float:
     entity. The bare field name is tried as well, and the better score wins.
     """
     best = _similarity(canonical, column)
-    words = normalise(canonical).split()
+
+    # Dropping the entity is what lets a bare "Owner" in the deals file
+    # find opportunity_owner. Across files it is the opposite of helpful:
+    # with both entities dropped, "Deal Name" matches account_name exactly
+    # as well as it matches opportunity_name, and every CRM object has a
+    # name, an owner and a created date.
+    #
+    # So within the file a field belongs to, drop it. Everywhere else,
+    # insist on it.
+    if not drop_entity:
+        return best
+
+    words = [canonicalise(w) for w in normalise(canonical).split()]
     if len(words) > 1 and words[0] in ENTITIES:
         # Dropping the entity helps find the column at all. It can no longer
         # cause a silent accept, because only an exact name does that.
@@ -113,8 +169,12 @@ def similarity(canonical: str, column: str) -> float:
 
 
 def _similarity(canonical: str, column: str) -> float:
-    a = " ".join(stem(w) for w in normalise(canonical).split())
-    b = " ".join(stem(w) for w in normalise(column).split())
+    a = " ".join(stem(canonicalise(w)) for w in normalise(canonical).split()
+                 if w not in LOOKUP_NOISE)
+    b = " ".join(stem(canonicalise(w)) for w in normalise(column).split()
+                 if w not in LOOKUP_NOISE)
+    if not a or not b:
+        return 0.0
     if not a or not b:
         return 0.0
     if a == b:
@@ -221,12 +281,27 @@ def band(score: float) -> str:
 
 def propose(canonical_key: str, description: str | None,
             expected_type: str | None, is_cap_bearing: bool,
-            canonical_field_id: str, columns: list[Column]) -> Proposal:
-    """Pick the best column for one canonical field, and say why."""
+            canonical_field_id: str, columns: list[Column],
+            own_exports: set[str] | None = None) -> Proposal:
+    """Pick the best column for one canonical field, and say why.
+
+    own_exports names the export lines this field is meant to come from.
+    Columns from those files are preferred; columns from anywhere else are
+    still considered, because a deals export carrying associated company
+    columns genuinely does serve the companies line.
+
+    The preference is what keeps them apart. Every CRM object has a
+    created date, so Created Date in the deals export matches
+    account_created_at exactly as well as it matches
+    opportunity_created_at. Without the preference the answer depends on
+    which file was read first.
+    """
     scored: list[tuple[float, Column, list[str]]] = []
+    own = own_exports or set()
 
     for col in columns:
-        base = similarity(canonical_key, col.name)
+        in_own_file = not own or col.export_ref in own
+        base = similarity(canonical_key, col.name, drop_entity=in_own_file)
 
         good: list[str] = []
         bad: list[str] = []
@@ -255,6 +330,11 @@ def propose(canonical_key: str, description: str | None,
                 f"({col.populated_rate:.0%})")
         else:
             good.append(f"is populated on {col.populated_count:,} rows")
+
+        if own and not in_own_file and score >= RESEARCH_FLOOR:
+            good.append(
+                f"is in the {col.export_ref or 'uploaded'} export rather "
+                f"than the one this field comes from, and still names it")
 
         if score > 0:
             scored.append((score, col, (good, bad)))

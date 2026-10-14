@@ -473,3 +473,34 @@ def profile_column(c: ColumnStats, rows: int) -> dict:
         # what the column usually holds, which is what identifies it.
         "sample_values": [v for v, _ in c.distinct.most_common(ColumnStats.SAMPLES)],
     }
+
+
+def rows_of(path: Path, result: ParseResult):
+    """Read the file again, yielding each row as a dict.
+
+    A second pass rather than keeping the rows from the first. The first
+    pass exists to count and profile without holding anything, and making
+    it accumulate rows as well would mean a large export sitting in memory
+    twice over. Reading a file twice is cheap; running out of memory on a
+    client's export is not.
+    """
+    names = [c.name for c in result.columns]
+    if result.encoding == "xlsx":
+        import xlsx
+        stream = xlsx.rows(path)
+        next(stream, None)                       # the header
+        for values in stream:
+            if not any(values):
+                continue
+            yield {n: storable(v).strip()
+                   for n, v in zip(names, values) if v != ""}
+        return
+
+    with path.open("r", encoding=result.encoding, newline="") as handle:
+        reader = csv.reader(handle, delimiter=result.delimiter)
+        next(reader, None)
+        for values in reader:
+            if not any(values):
+                continue
+            yield {n: storable(v).strip()
+                   for n, v in zip(names, values) if v.strip() != ""}
