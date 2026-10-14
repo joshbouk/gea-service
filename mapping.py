@@ -160,12 +160,75 @@ def similarity(canonical: str, column: str, drop_entity: bool = True) -> float:
     if not drop_entity:
         return best
 
-    words = [canonicalise(w) for w in normalise(canonical).split()]
-    if len(words) > 1 and words[0] in ENTITIES:
+    raw_words = normalise(canonical).split()
+    words = [canonicalise(w) for w in raw_words]
+
+    # Drop every leading entity word, not only the first.
+    #
+    # Tested against the words as written, not the canonicalised ones:
+    # SAME_THING maps stage to status, so a key beginning "stage_" stopped
+    # looking like it began with an entity at all.
+    #
+    # stage_history_opportunity_id names the object twice over, and no
+    # column anywhere says "stage history": the file is the stage history,
+    # so its column is just "Opportunity ID". Dropping one word left
+    # "history opportunity id" and the correct column scored a third.
+    lead = 0
+    while lead < len(raw_words) - 1 and raw_words[lead] in ENTITIES:
+        lead += 1
+    if lead:
+        rest = " ".join(words[lead:])
+        best = max(best, _similarity(rest, column) * 0.95)
+
+    if len(raw_words) > 1 and raw_words[0] in ENTITIES:
         # Dropping the entity helps find the column at all. It can no longer
         # cause a silent accept, because only an exact name does that.
         best = max(best, _similarity(" ".join(words[1:]), column))
     return best
+
+
+def contains_the_words(canonical: str, column: str) -> float:
+    """Whether the column name contains what the canonical name means.
+
+    Edit distance alone put County above Billing Country for
+    account_country, by six thousandths. One of those contains the word
+    and the other merely resembles it, and a near-miss that wins is worse
+    than no match at all: nobody checks a proposal that looks right.
+
+    Structural words are dropped from what must be present. A column has
+    no reason to repeat the "count" in account_employee_count, which is
+    why Employees scored 0.6 against a field it obviously is.
+    """
+    all_words = tokens(canonical)
+    want = {w for w in all_words if w not in STRUCTURAL} or all_words
+    structural = all_words - want
+    got = tokens(column)
+    if not want or not got:
+        return 0.0
+    hit = len(want & got)
+    if hit == 0:
+        return 0.0
+
+    covered = hit / len(want)
+    focus = hit / len(got)
+    score = covered * (0.72 + 0.28 * focus)
+
+    # A structural word is not required and is still evidence.
+    #
+    # Dropping it from what must be present is what let Employees match
+    # account_employee_count. Dropping it entirely is what let a column
+    # called Opportunities beat Opportunity Name for opportunity_name:
+    # with "name" discarded the field wants only "opportunity", and the
+    # bare column matches that with nothing diluting it while the correct
+    # column is diluted by a second word.
+    #
+    # So it decides which match is best without deciding whether there is
+    # one. A column carrying the structural word is nearer the field than
+    # one that leaves it out.
+    if structural:
+        present = len(structural & got) / len(structural)
+        score = min(1.0, score * (0.88 + 0.12 * present) + 0.08 * present)
+    return score
 
 
 def _similarity(canonical: str, column: str) -> float:
@@ -175,8 +238,10 @@ def _similarity(canonical: str, column: str) -> float:
                  if w not in LOOKUP_NOISE)
     if not a or not b:
         return 0.0
+    by_words = contains_the_words(canonical, column)
     if not a or not b:
         return 0.0
+    by_words = contains_the_words(canonical, column)
     if a == b:
         return 1.0
 
@@ -193,7 +258,19 @@ def _similarity(canonical: str, column: str) -> float:
     if contains and len(tb) > len(ta):
         contains *= max(0.0, 1.0 - 0.18 * (len(tb) - len(ta)))
 
-    return max(contains * 0.95, overlap * 0.9 + sequence * 0.1, sequence * 0.85)
+    # Spelling is the weakest evidence and was the loudest. County scored
+    # 0.785 against account_country and Billing Country scored 0.779, which
+    # is edit distance deciding a question about meaning.
+    #
+    # So a column holding the canonical's meaningful words outranks one
+    # that merely looks like them, and the pure-spelling path is capped
+    # below the floor: a name that resembles a field without containing
+    # any of its words is a guess, and a guess that clears the floor gets
+    # auto-accepted.
+    return max(contains * 0.95,
+               by_words,
+               overlap * 0.9 + sequence * 0.1,
+               sequence * 0.72)
 
 
 @dataclass

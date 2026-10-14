@@ -67,6 +67,8 @@ DATE_PATTERNS = (
     "%d %b %Y", "%d %B %Y", "%b %d, %Y", "%Y-%m-%dT%H:%M:%S",
     "%Y-%m-%d %H:%M:%S",
 )
+_SLASH_DATE = re.compile(r"^\s*\d{1,2}[/-]\d{1,2}[/-]\d{4}")
+_UNDECIDED = object()
 NUMERIC = re.compile(r"^-?[\d,]*\.?\d+$")
 BOOLEAN = {"true", "false", "yes", "no", "y", "n", "1", "0", "t", "f"}
 
@@ -160,16 +162,47 @@ class ColumnStats:
     boolean_like: int = 0
     earliest: date | None = None
     latest: date | None = None
+    # A few date-shaped values as written, enough to tell a US column from
+    # a British one. The question cannot be answered one value at a time.
+    date_samples: list = field(default_factory=list)
 
     # Keeping every distinct value of a free-text column would hold the whole
     # file in memory. Past this the count becomes a floor and is reported as
     # such rather than as a precise figure.
     CAP = 50_000
 
+    _direction: object = _UNDECIDED
+
     # How many real values to keep for someone deciding what this column is.
     # Distinct, so a column that reads "Closed Won" nine times out of ten
     # shows what else it can be rather than the same word repeated.
     SAMPLES = 10
+
+    @property
+    def day_first(self) -> bool | None:
+        """Decided once from what has been seen, and cached."""
+        if self._direction is _UNDECIDED:
+            self._direction = which_way_round(self.date_samples)
+        return self._direction
+
+    def settle_dates(self) -> None:
+        """Decide the direction, then read the samples again.
+
+        The first values of a column are observed before enough of it has
+        been seen to know which way round its dates are. Once the column
+        is finished the decision is sound, and the earliest and latest are
+        recomputed from the samples under it rather than left as whatever
+        the first guess produced.
+        """
+        self._direction = which_way_round(self.date_samples)
+        for v in self.date_samples:
+            d = parse_date(v, self._direction)
+            if d is None:
+                continue
+            if self.earliest is None or d < self.earliest:
+                self.earliest = d
+            if self.latest is None or d > self.latest:
+                self.latest = d
 
     def observe(self, value: str) -> None:
         value = storable(value).strip()
@@ -188,7 +221,9 @@ class ColumnStats:
         if NUMERIC.match(value):
             self.numeric_like += 1
             return
-        parsed = parse_date(value)
+        if len(self.date_samples) < 400 and _SLASH_DATE.match(value):
+            self.date_samples.append(value)
+        parsed = parse_date(value, self.day_first)
         if parsed is not None:
             self.date_like += 1
             if self.earliest is None or parsed < self.earliest:
@@ -197,13 +232,67 @@ class ColumnStats:
                 self.latest = parsed
 
 
-def parse_date(value: str) -> date | None:
+def parse_date(value: str, day_first: bool | None = None) -> date | None:
+    """A date, or None.
+
+    10/1/2024 is the first of October to Salesforce and the tenth of
+    January to a British CRM, and both parse. Trying one order before the
+    other silently transposes every date whose day is twelve or less,
+    which is about forty per cent of them, and nothing anywhere looks
+    wrong: an opportunity simply moved in January instead of October.
+
+    So the order is decided per column by which_way_round, from the whole
+    column rather than one value, and passed in. Where nothing in the
+    column settles it, the ISO forms still work and the ambiguous ones are
+    read month first, because that is the commoner export.
+    """
     head = value[:32]
-    for pattern in DATE_PATTERNS:
+    patterns = DATE_PATTERNS
+    if day_first is None:
+        day_first = False
+    if day_first is not None:
+        ambiguous = ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%m-%d-%Y")
+        preferred = (("%d/%m/%Y", "%d-%m-%Y") if day_first
+                     else ("%m/%d/%Y", "%m-%d-%Y"))
+        patterns = (tuple(p for p in DATE_PATTERNS if p not in ambiguous
+                          and "%H" not in p)
+                    + preferred
+                    + tuple(p for p in DATE_PATTERNS if "%H" in p))
+    for pattern in patterns:
         try:
             return datetime.strptime(head, pattern).date()
         except ValueError:
             continue
+    return None
+
+
+def which_way_round(values) -> bool | None:
+    """Whether a column's dates are day first, from the column itself.
+
+    A single value cannot say. A column almost always can: one date with
+    a first part above twelve settles it, because no month is the
+    thirteenth. Returns None where every value is ambiguous, which is rare
+    over more than a handful of rows and honest when it happens.
+    """
+    slash = re.compile(r"^\s*(\d{1,2})[/-](\d{1,2})[/-](\d{4})")
+    day_first = month_first = 0
+    for v in values:
+        m = slash.match(str(v or ""))
+        if not m:
+            continue
+        a, b = int(m.group(1)), int(m.group(2))
+        if a > 12 and b <= 12:
+            day_first += 1
+        elif b > 12 and a <= 12:
+            month_first += 1
+    if day_first and not month_first:
+        return True
+    if month_first and not day_first:
+        return False
+    if day_first or month_first:
+        # Both appear, so the column is inconsistent. The commoner wins
+        # and the disagreement is worth nothing being confident about.
+        return day_first > month_first
     return None
 
 
@@ -239,6 +328,16 @@ def what_is_this(path: Path) -> str:
     for magic, kind in MAGIC:
         if head.startswith(magic):
             return kind
+
+    # Salesforce's "Export to Excel" writes an HTML table and calls it
+    # .xls. Excel opens it, so nobody notices, and a reader that trusts
+    # the extension finds markup where it expected rows. A client's
+    # opportunity history arrived this way: six thousand transitions in a
+    # file nothing here could read.
+    start = path.read_bytes()[:2048].lstrip().lower()
+    if start.startswith((b"<html", b"<!doctype html", b"<head", b"<table",
+                         b"<?xml")) or b"<table" in start:
+        return "html"
     return "text"
 
 
@@ -295,6 +394,9 @@ def read_workbook(path: Path, on_progress=None) -> ParseResult:
         for name, value in zip(names, values):
             by_name[name].observe(value)
 
+    for c in columns:
+        c.settle_dates()
+
     if rows == 0:
         raise ParseError("the sheet has column names and no rows.")
 
@@ -319,6 +421,108 @@ def read_workbook(path: Path, on_progress=None) -> ParseResult:
     )
 
 
+def read_html_table(path: Path, on_progress=None) -> ParseResult:
+    """Read the largest table out of an HTML document.
+
+    Salesforce reports exported "to Excel" are HTML, and so are several
+    other systems' exports. The markup is plain: one table, a header row
+    of th cells, a body of tr and td. No parser library is needed and
+    none is carried.
+
+    The largest table, because a report often wraps its data in a layout
+    table and the data is the one with the most rows.
+    """
+    import html as _html
+
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-8", "iso-8859-1"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = raw.decode("iso-8859-1", "replace")
+
+    tables = re.findall(r"<table[^>]*>(.*?)</table>", text, re.S | re.I)
+    if not tables:
+        raise ParseError(
+            "that file is HTML with no table in it, so there are no rows "
+            "to read.")
+    body = max(tables, key=lambda t: t.count("<tr"))
+
+    cell = re.compile(r"<t[hd][^>]*>(.*?)</t[hd]>", re.S | re.I)
+    tag = re.compile(r"<[^>]+>")
+
+    def read_row(chunk: str) -> list[str]:
+        return [storable(_html.unescape(tag.sub("", c))).strip()
+                for c in cell.findall(chunk)]
+
+    raw_rows = re.findall(r"<tr[^>]*>(.*?)</tr>", body, re.S | re.I)
+    if not raw_rows:
+        raise ParseError("that table has no rows in it.")
+
+    header = read_row(raw_rows[0])
+    while header and header[-1] == "":
+        header.pop()
+    if not any(header):
+        raise ParseError(
+            "the first row of that table is blank, so there are no column "
+            "names.")
+
+    seen: Counter = Counter()
+    names: list[str] = []
+    for i, name in enumerate(header):
+        name = name or f"(unnamed column {i + 1})"
+        seen[name] += 1
+        names.append(name if seen[name] == 1 else f"{name} ({seen[name]})")
+
+    columns = [ColumnStats(n) for n in names]
+    by_name = {c.name: c for c in columns}
+    rows = malformed = 0
+    malformed_examples: list[dict] = []
+
+    for chunk in raw_rows[1:]:
+        values = read_row(chunk)
+        if not any(values):
+            continue
+        # A Salesforce report ends with grand-total rows that have fewer
+        # cells than the header and no record in them. They are not data.
+        if len(values) < max(2, len(names) // 2):
+            continue
+        rows += 1
+        if len(values) > len(names):
+            malformed += 1
+            if len(malformed_examples) < 5:
+                malformed_examples.append(
+                    {"row": rows + 1, "found": len(values),
+                     "expected": len(names)})
+        for name, value in zip(names, values):
+            by_name[name].observe(value)
+        if on_progress and rows % 2000 == 0:
+            on_progress(rows, 0)
+
+    for c in columns:
+        c.settle_dates()
+
+    if rows == 0:
+        raise ParseError("that table has column names and no rows.")
+
+    dated = [c for c in columns
+             if c.populated > 0 and c.date_like / c.populated > 0.9
+             and c.date_like > 0]
+    primary = max(dated, key=lambda c: c.date_like, default=None)
+
+    return ParseResult(
+        row_count=rows, column_count=len(names), malformed_rows=malformed,
+        malformed_examples=malformed_examples, columns=columns,
+        encoding="html", delimiter="",
+        primary_date_field=primary.name if primary else None,
+        date_min=primary.earliest if primary else None,
+        date_max=primary.latest if primary else None,
+    )
+
+
 def read_export(path: Path, on_progress=None) -> ParseResult:
     """Stream the file once, counting everything worth counting."""
     kind = what_is_this(path)
@@ -329,6 +533,8 @@ def read_export(path: Path, on_progress=None) -> ParseResult:
             "this is an Excel file in the old binary format, which the "
             "service cannot read. Open it in Excel and save it as .xlsx or "
             "as CSV.")
+    if kind == "html":
+        return read_html_table(path, on_progress)
     if kind == "pdf":
         raise ParseError(
             "this is a PDF. An export has to be a spreadsheet or a CSV; a "
@@ -400,6 +606,9 @@ def read_export(path: Path, on_progress=None) -> ParseResult:
 
     # The primary date field is the date-like column covering the most rows.
     # Nothing is invented: if no column parses as dates, this stays empty.
+    for c in columns:
+        c.settle_dates()
+
     dated = [c for c in columns
              if c.populated > 0 and c.date_like / c.populated > 0.9 and c.date_like > 0]
     primary = max(dated, key=lambda c: c.date_like, default=None)
@@ -485,6 +694,42 @@ def rows_of(path: Path, result: ParseResult):
     client's export is not.
     """
     names = [c.name for c in result.columns]
+
+    # Dates are written as the client wrote them, normalised to ISO using
+    # the direction decided for each column. Downstream there is then
+    # nothing left to guess: a stored date means one thing.
+    direction = {c.name: c.day_first for c in result.columns
+                 if c.date_like and c.populated
+                 and c.date_like / c.populated > 0.5}
+
+    def fixed(name: str, value: str) -> str:
+        if name not in direction or not value:
+            return value
+        d = parse_date(value, direction[name])
+        return d.isoformat() if d else value
+    if result.encoding == "html":
+        import html as _html
+        raw = path.read_bytes()
+        for enc in ("utf-8-sig", "utf-8", "iso-8859-1"):
+            try:
+                text = raw.decode(enc); break
+            except UnicodeDecodeError:
+                continue
+        else:
+            text = raw.decode("iso-8859-1", "replace")
+        tables = re.findall(r"<table[^>]*>(.*?)</table>", text, re.S | re.I)
+        body = max(tables, key=lambda t: t.count("<tr"))
+        cell = re.compile(r"<t[hd][^>]*>(.*?)</t[hd]>", re.S | re.I)
+        tag = re.compile(r"<[^>]+>")
+        chunks = re.findall(r"<tr[^>]*>(.*?)</tr>", body, re.S | re.I)
+        for chunk in chunks[1:]:
+            values = [storable(_html.unescape(tag.sub("", c))).strip()
+                      for c in cell.findall(chunk)]
+            if not any(values) or len(values) < max(2, len(names) // 2):
+                continue
+            yield {n: fixed(n, v) for n, v in zip(names, values) if v != ""}
+        return
+
     if result.encoding == "xlsx":
         import xlsx
         stream = xlsx.rows(path)
@@ -492,7 +737,7 @@ def rows_of(path: Path, result: ParseResult):
         for values in stream:
             if not any(values):
                 continue
-            yield {n: storable(v).strip()
+            yield {n: fixed(n, storable(v).strip())
                    for n, v in zip(names, values) if v != ""}
         return
 
@@ -502,5 +747,5 @@ def rows_of(path: Path, result: ParseResult):
         for values in reader:
             if not any(values):
                 continue
-            yield {n: storable(v).strip()
+            yield {n: fixed(n, storable(v).strip())
                    for n, v in zip(names, values) if v.strip() != ""}
