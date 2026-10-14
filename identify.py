@@ -134,8 +134,109 @@ def line_sizes(conn, engagement_id: str) -> dict[str, int]:
     return dict(out)
 
 
-def identify(columns: list[dict], vocab: list[dict], sizes: dict[str, int]
-             ) -> Identification:
+# What a column's values say about it, when its name says nothing.
+#
+# Name matching gets seven of nine real exports right. The two it misses
+# are the ones whose columns are called Role, Stage, Entered — words every
+# CRM object uses. The values settle both instantly: a column holding
+# Closed Won and Closed Lost is a deal stage, and one holding Decision
+# Maker is a contact role.
+#
+# Salesforce is easier still. The first three characters of an id say what
+# object it belongs to, so a key column starting 006 is an opportunity
+# export whoever renamed its columns.
+VALUE_SIGNATURES = [
+    ("T1-01", ("closed won", "closed lost", "closedwon", "closed/won",
+               "negotiation", "prospecting", "qualification")),
+    ("T1-08", ("decision maker", "economic buyer", "champion", "influencer",
+               "evaluator", "technical buyer", "executive sponsor")),
+    ("T2-03", ("call", "email", "meeting", "task", "note logged",
+               "inbound call", "outbound call")),
+    ("T1-10", ("open - not contacted", "working - contacted", "unqualified",
+               "mql", "sql", "marketing qualified lead")),
+    ("T1-06", ("new", "open", "pending", "on hold", "solved", "escalated")),
+    ("T3-08", ("commit", "best case", "pipeline", "omitted", "closed")),
+]
+
+
+def from_values(conn, dataset_id: str, columns: list[dict]) -> dict[str, float]:
+    """Which export lines this file's own values point at."""
+    votes: dict[str, float] = defaultdict(float)
+    with conn.cursor() as cur:
+        for col in columns:
+            # A column with hundreds of distinct values is a name or an
+            # amount, and tells us nothing about what the file is.
+            distinct = col.get("distinct_count") or 0
+            if distinct == 0 or distinct > 40:
+                continue
+            cur.execute("""
+                select lower(btrim(r.data ->> %s)) as v, count(*)
+                  from dataset_row r
+                 where r.dataset_id = %s
+                   and nullif(btrim(r.data ->> %s), '') is not null
+                 group by 1 order by 2 desc limit 40
+            """, (col["name"], dataset_id, col["name"]))
+            seen = {v for v, _n in cur.fetchall()}
+            if not seen:
+                continue
+            for ref, words in VALUE_SIGNATURES:
+                hits = sum(1 for w in words if any(w in v for v in seen))
+                if hits >= 2:
+                    votes[ref] += hits
+    conn.rollback()
+    return dict(votes)
+
+
+def from_salesforce_ids(conn, dataset_id: str, columns: list[dict]
+                        ) -> tuple[str | None, str | None]:
+    """The object a Salesforce key column names, and the column it was in.
+
+    Only the file's own key. A contact roles export carries a Contact ID
+    and an Opportunity ID, and reading either as the file's identity makes
+    it a contacts export or a deals export — which it is not. Both are
+    foreign keys and neither says what the file is.
+
+    The file's own key is the one column that is unique, fully populated,
+    and the only such column. Where two columns both look unique, nothing
+    here can tell which is the subject, so this says nothing at all rather
+    than guessing.
+    """
+    unique = [c for c in columns
+              if (c.get("row_count") or 0)
+              and (c.get("populated_rate") or 0) >= 0.99
+              and (c.get("distinct_count") or 0) / (c.get("row_count") or 1)
+                  >= KEY_DISTINCT]
+    if len(unique) != 1:
+        return None, None
+
+    with conn.cursor() as cur:
+        for col in unique:
+            cur.execute("""
+                select gea_id_prefix_object(r.data ->> %s)
+                  from dataset_row r
+                 where r.dataset_id = %s
+                   and nullif(btrim(r.data ->> %s), '') is not null
+                 limit 1
+            """, (col["name"], dataset_id, col["name"]))
+            row = cur.fetchone()
+            if row and row[0]:
+                conn.rollback()
+                return row[0], col["name"]
+    conn.rollback()
+    return None, None
+
+
+# Which export line each Salesforce object belongs to.
+SALESFORCE_OBJECT_LINE = {
+    "opportunity": "T1-01", "account": "T1-02", "contact": "T1-03",
+    "lead": "T1-10", "case": "T1-06", "contract": "T1-07",
+    "order": "T1-07", "task": "T2-03", "event": "T2-03",
+    "opportunity_contact_role": "T1-08",
+}
+
+
+def identify(columns: list[dict], vocab: list[dict], sizes: dict[str, int],
+             conn=None, dataset_id: str | None = None) -> Identification:
     """What is this file?
 
     columns wants, per column: name, populated_rate, distinct_count,
@@ -194,6 +295,30 @@ def identify(columns: list[dict], vocab: list[dict], sizes: dict[str, int]
     ranked = sorted(weight.items(), key=lambda kv: -kv[1])
     top_ref, top_weight = ranked[0]
     runner_up, second_weight = (ranked[1] if len(ranked) > 1 else (None, 0.0))
+
+    # What the values say, where there are rows to look at. This is the
+    # half that settles a file whose column names are Role and Stage.
+    if conn is not None and dataset_id is not None:
+        obj, in_column = from_salesforce_ids(conn, dataset_id, columns)
+        if obj and obj in SALESFORCE_OBJECT_LINE:
+            ref = SALESFORCE_OBJECT_LINE[obj]
+            return Identification(
+                ref, "clear", count.get(ref, 0), sizes.get(ref, 0),
+                in_column, None,
+                also_serves=sorted(r for r, n in count.items()
+                                   if r != ref and n >= 3),
+                matches=sorted(best_per_column.values(), key=lambda m: -m.score),
+                reason=(f"The {in_column} column holds Salesforce ids "
+                        f"beginning {obj[:3]}, which is how Salesforce "
+                        f"writes a {obj.replace('_', ' ')}. That settles it "
+                        f"whatever the columns are called."))
+
+        for ref, weight_from_values in from_values(conn, dataset_id, columns).items():
+            weight[ref] += weight_from_values
+            count[ref] = max(count.get(ref, 0), 1)
+        ranked = sorted(weight.items(), key=lambda kv: -kv[1])
+        top_ref, top_weight = ranked[0]
+        runner_up, second_weight = (ranked[1] if len(ranked) > 1 else (None, 0.0))
 
     share = count[top_ref] / max(sizes.get(top_ref, 1), 1)
     if count[top_ref] < ENOUGH_MATCHES or share < ENOUGH_OF_THE_LINE:
