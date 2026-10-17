@@ -150,16 +150,23 @@ def parse_export(conn, run_id: str, engagement_id: str, artefact_ids: list[str],
     # Queued here rather than by a database trigger because only this code
     # knows a read has just finished. A trigger would have to infer it from
     # the row, and a re-read of the same file leaves the row looking identical.
+    # No parameters at all, so two reads finishing together produce one
+    # proposal run rather than two.
+    #
+    # This used to pass the dataset just read and a timestamp, reasoning
+    # that two readings a second apart each deserved their own run. They
+    # do not. Proposing mappings reads every column of every file on the
+    # engagement and proposes a column for every canonical field: it is
+    # not about the file that triggered it, and running it three times
+    # after three reads produced the identical answer three times.
+    #
+    # The timestamp was the worse half. With it in the parameters no two
+    # calls could ever look alike, so the deduplication the database does
+    # was switched off by construction.
     with conn.cursor() as cur:
         cur.execute(
             """select run_id, was_created from gea_enqueue_run(
-                   %s, 'propose_mappings', null, null, null, null, %s::jsonb)""",
-            (engagement_id, json.dumps({
-                "after_dataset": str(dataset_id),
-                # Microseconds, because two readings a second apart are still
-                # two readings and each deserves its own proposal run.
-                "read_at": datetime.now(timezone.utc).isoformat(),
-            })))
+                   %s, 'propose_mappings')""", (engagement_id,))
     conn.commit()
 
     flagged = sum(1 for p in profiles if p["flags"])

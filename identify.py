@@ -236,7 +236,8 @@ SALESFORCE_OBJECT_LINE = {
 
 
 def identify(columns: list[dict], vocab: list[dict], sizes: dict[str, int],
-             conn=None, dataset_id: str | None = None) -> Identification:
+             conn=None, dataset_id: str | None = None,
+             engagement_id: str | None = None) -> Identification:
     """What is this file?
 
     columns wants, per column: name, populated_rate, distinct_count,
@@ -295,6 +296,33 @@ def identify(columns: list[dict], vocab: list[dict], sizes: dict[str, int],
     ranked = sorted(weight.items(), key=lambda kv: -kv[1])
     top_ref, top_weight = ranked[0]
     runner_up, second_weight = (ranked[1] if len(ranked) > 1 else (None, 0.0))
+
+    # What the files beside it say.
+    #
+    # A Salesforce export set arrives together and references itself. A
+    # file whose Opportunity IDs all appear in the deals export, and whose
+    # Contact IDs all appear in the contacts export, is one of the two
+    # lines that join deals to people — which takes twenty candidates down
+    # to two before a single column name has been read.
+    #
+    # A filter rather than an answer. What separates contact roles from
+    # activities is the values, and the narrowing is what makes reading
+    # them decisive instead of suggestive.
+    narrowed_to: list[str] = []
+    if conn is not None and dataset_id is not None and engagement_id:
+        pointed_at = set(from_the_other_files(conn, engagement_id,
+                                              dataset_id, columns).values())
+        narrowed_to = lines_that_reference(conn, engagement_id, pointed_at)
+        if narrowed_to:
+            weight = {r: w for r, w in weight.items() if r in narrowed_to} \
+                or weight
+            count = {r: n for r, n in count.items() if r in narrowed_to} \
+                or count
+            if weight:
+                ranked = sorted(weight.items(), key=lambda kv: -kv[1])
+                top_ref, top_weight = ranked[0]
+                runner_up, second_weight = (ranked[1] if len(ranked) > 1
+                                            else (None, 0.0))
 
     # What the values say, where there are rows to look at. This is the
     # half that settles a file whose column names are Role and Stage.
@@ -365,6 +393,115 @@ def identify(columns: list[dict], vocab: list[dict], sizes: dict[str, int],
         also_serves=sorted(also), runner_up=runner_up,
         matches=sorted(best_per_column.values(), key=lambda m: -m.score),
         reason=reason)
+
+
+def from_the_other_files(conn, engagement_id: str, dataset_id: str,
+                         columns: list[dict]) -> dict[str, str]:
+    """What this file's keys say about it, given the files beside it.
+
+    A Salesforce export set arrives together and the files reference each
+    other. A file whose every Opportunity ID appears in the deals export's
+    key column is about deals: contact roles, line items and stage history
+    all announce themselves this way and none of them can be told apart by
+    their column names, which are Role, Quantity and Stage.
+
+    Returns the export line each foreign key points at. A file pointing at
+    deals and at contacts is the contact roles export and nothing else is.
+    """
+    out: dict[str, str] = {}
+    with conn.cursor() as cur:
+        # The key column of every other file on the engagement, and which
+        # line that file was taken for.
+        cur.execute("""
+            select d.id::text, el.ref, p.field_name
+              from dataset d
+              join artefact a on a.id = d.artefact_id and a.purged_at is null
+              join export_request_line erl on erl.id = a.export_request_line_id
+              join export_line el on el.id = erl.export_line_id
+              join dataset_field_profile p on p.dataset_id = d.id
+             where a.engagement_id = %s
+               and d.id <> %s
+               and d.parse_status = 'parsed'
+               and p.populated_rate >= 0.99
+               and d.row_count > 0
+               and p.distinct_count::numeric / d.row_count >= %s
+        """, (engagement_id, dataset_id, KEY_DISTINCT))
+        others = cur.fetchall()
+
+        for col in columns:
+            # Only a column that looks like a reference: well populated,
+            # and repeating. A unique column is this file's own key.
+            rows = col.get("row_count") or 0
+            if not rows or (col.get("populated_rate") or 0) < 0.5:
+                continue
+            if (col.get("distinct_count") or 0) / rows > 0.9:
+                continue
+
+            for other_ds, ref, other_col in others:
+                cur.execute("""
+                    select count(*) filter (where there.v is not null),
+                           count(*)
+                      from (select distinct nullif(btrim(r.data ->> %s), '') as v
+                              from dataset_row r where r.dataset_id = %s
+                             limit 300) mine
+                      left join lateral (
+                        select 1 as v from dataset_row o
+                         where o.dataset_id = %s
+                           and nullif(btrim(o.data ->> %s), '') = mine.v
+                         limit 1) there on true
+                     where mine.v is not null
+                """, (col["name"], dataset_id, other_ds, other_col))
+                found, looked = cur.fetchone()
+                # Nearly all of them, or it is a coincidence of format.
+                if looked >= 10 and found / looked >= 0.9:
+                    out[col["name"]] = ref
+                    break
+    conn.rollback()
+    return out
+
+
+def lines_that_reference(conn, engagement_id: str, refs: set[str]) -> list[str]:
+    """Which export lines join the things this file points at.
+
+    No table of combinations is needed: the field keys say it. T1-08 wants
+    contact_role_opportunity_id and contact_role_contact_id, so the
+    contact roles export is a line that references deals and people, and
+    a file whose keys point at both is one of the lines that does.
+
+    A filter rather than an answer. Contact roles and activities both
+    reference deals and people, and what separates those is the values —
+    Decision Maker against Call and Email — which the rest of the
+    identification already reads. Narrowing from twenty lines to two is
+    what makes that reading decisive.
+    """
+    if not refs:
+        return []
+    with conn.cursor() as cur:
+        cur.execute("""
+            select cf.key, cf.source_export_refs
+              from canonical_field cf
+              join engagement e on e.id = %s
+                               and e.instrument_version_id = cf.instrument_version_id
+             where cf.key ~ '_(opportunity|contact|account|subscription)_id$'
+        """, (engagement_id,))
+        rows = cur.fetchall()
+    conn.rollback()
+
+    # What each line references, from the keys it wants.
+    OWNER = {"_opportunity_id": "T1-01", "_contact_id": "T1-03",
+             "_account_id": "T1-02", "_subscription_id": "T1-07"}
+    references: dict[str, set] = defaultdict(set)
+    for key, line_refs in rows:
+        for suffix, points_at in OWNER.items():
+            if key.endswith(suffix):
+                for ref in (line_refs or []):
+                    # A line does not reference itself: T1-01 holds
+                    # opportunity_account_id and is not a file about
+                    # accounts.
+                    if ref != points_at:
+                        references[ref].add(points_at)
+    return sorted(ref for ref, pointed in references.items()
+                  if pointed == refs)
 
 
 def find_key(columns: list[dict], matched: dict[str, Match],

@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 import psycopg
 
 import analyses
+import rollup
 import model
 import realjobs
 import storage
@@ -305,6 +306,53 @@ def work_one(conn: psycopg.Connection) -> bool:
                 (total, total, json.dumps(output), analyses.VERSION, run_id))
         conn.commit()
         log(f"succeeded {job_type}  {describe(output)}")
+
+        # What this analysis found may change what the engagement adds up
+        # to, so the roll-up is queued. It is deduplicated by the
+        # database, so three analyses finishing together produce one.
+        if key != "roll_up":
+            # Keyed on the evidence it will read, so two analyses finishing
+            # together queue one roll-up and a later analysis queues
+            # another. Queued with no key at all, the first roll-up an
+            # engagement ever ran was returned to every request after it.
+            with conn.cursor() as cur:
+                try:
+                    cur.execute("select run_id from gea_enqueue_rollup(%s)",
+                                (engagement_id,))
+                except psycopg.errors.CheckViolation:
+                    # Nothing usable to add up yet. Not a failure of the
+                    # analysis that just succeeded.
+                    conn.rollback()
+                else:
+                    conn.commit()
+        return True
+
+    if job_type == "roll_up":
+        with conn.cursor() as cur:
+            cur.execute("select engagement_id from analysis_run where id = %s",
+                        (run_id,))
+            engagement_id = cur.fetchone()[0]
+        conn.rollback()
+        try:
+            total, output = rollup.run(conn, engagement_id, heartbeat)
+        except ValueError as exc:
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute("update analysis_run set status='failed', "
+                            "finished_at=now(), error=%s where id=%s",
+                            (str(exc), run_id))
+            conn.commit()
+            log(f"failed    roll_up  {exc}")
+            return True
+        with conn.cursor() as cur:
+            cur.execute(
+                "update analysis_run set status='succeeded', finished_at=now(), "
+                "progress_done=%s, progress_total=%s, compute_output=%s::jsonb, "
+                "model_name=%s where id=%s",
+                (total, total, json.dumps(output), analyses.VERSION, run_id))
+        conn.commit()
+        log(f"succeeded roll_up  {output['findings_stored']} findings from "
+            f"{output['analyses_read']} analyses")
         return True
 
     try:
