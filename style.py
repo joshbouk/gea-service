@@ -195,8 +195,8 @@ def _alliterative(heading: str) -> bool:
     return False
 
 
-def check(text: str, section: str = "", findings_section: bool = False
-          ) -> list[Finding]:
+def check(text: str, section: str = "", findings_section: bool = False,
+          asking: bool = False) -> list[Finding]:
     """Read a draft and return everything that breaks a hard rule."""
     out: list[Finding] = []
 
@@ -226,7 +226,7 @@ def check(text: str, section: str = "", findings_section: bool = False
             add("4", "a colon before the reveal", s,
                 "Drop the run-up and say the second half.")
 
-        if _QUESTION.search(s):
+        if _QUESTION.search(s) and not asking:
             add("5", "a rhetorical question", s,
                 "The reader is paying for answers.")
 
@@ -285,8 +285,17 @@ def check(text: str, section: str = "", findings_section: bool = False
     return out
 
 
-def report(text: str, section: str = "", findings_section: bool = False) -> dict:
-    found = check(text, section, findings_section)
+def report(text: str, section: str = "", findings_section: bool = False,
+           asking: bool = False) -> dict:
+    """Check a piece of writing against the style rules.
+
+    asking exempts rule 5, for text whose whole job is to be a question:
+    an export line that asks what a client's deals look like, or a
+    question an analysis raised for an interviewer. Rule 5 is about a
+    report asking something it intends to answer itself, and pointing it
+    at a question is a category error that has now been made twice.
+    """
+    found = check(text, section, findings_section, asking)
     refusals = [f for f in found if f.refuses]
     advisories = [f for f in found if not f.refuses]
     by_rule: dict[str, int] = {}

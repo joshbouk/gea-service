@@ -54,6 +54,27 @@ def _plain(value):
 
 
 @dataclass
+class Question:
+    """Something the data raised that only a person can settle.
+
+    The analyses that look hardest at a client's data are the ones that
+    find things no export explains: a field populated on an eighth of the
+    records, a deal value in six columns and none of them called Amount,
+    a division missing from a quarter of the pipeline. Each has one right
+    person to ask and takes ninety seconds in an interview.
+    """
+    analysis_key: str
+    question: str
+    because: str
+    ask_role: str
+    element_refs: list = field(default_factory=list)
+
+    def as_row(self, engagement_id: str, run_id: str | None):
+        return (engagement_id, self.analysis_key, self.question,
+                self.because, self.element_refs, self.ask_role, run_id)
+
+
+@dataclass
 class Finding:
     analysis_key: str
     kind: str
@@ -203,6 +224,61 @@ def compare_eras(pipelines: list[dict], elements: list[str]) -> list[Finding]:
     return out
 
 
+# Who can answer what. A question about what populates a field is for
+# whoever runs the CRM; one about why a division behaves differently is
+# for whoever runs the division. Asking either of the other wastes both
+# conversations.
+REVOPS, SALES, MARKETING, FINANCE = ("operations", "sales", "marketing",
+                                     "finance")
+
+
+def questions_from(analysis_key: str, output: dict) -> list[Question]:
+    """What this analysis found that it cannot explain."""
+    out: list[Question] = []
+    pop = output.get("population", {})
+    rows = output.get("by_segment") or []
+
+    if analysis_key == "win_loss_and_churn_patterns":
+        unq, lost = pop.get("unqualified") or 0, pop.get("lost") or 0
+        if unq > lost:
+            out.append(Question(
+                analysis_key,
+                "What has to be true for a deal to be qualified out rather "
+                "than worked? And who makes that call?",
+                f"{unq} deals were closed as unqualified against {lost} "
+                f"lost to somebody else, so what goes wrong is happening "
+                f"before a competitor is involved.",
+                SALES, ["1.1", "4.5", "5.1"]))
+
+        top = [r for r in rows if r.get("depth") == 1
+               and r.get("rate") is not None]
+        if len(top) >= 2:
+            top.sort(key=lambda r: -r["rate"])
+            if top[0]["rate"] - top[-1]["rate"] >= WORTH_SAYING:
+                out.append(Question(
+                    analysis_key,
+                    f"Why does {_name(top[-1]['segment'])} convert so "
+                    f"differently from {_name(top[0]['segment'])}? Is it "
+                    f"the market, the people, or how deals get in?",
+                    f"{_pct(top[0]['rate'])} against "
+                    f"{_pct(top[-1]['rate'])}, on "
+                    f"{top[0]['of']} and {top[-1]['of']} closed deals.",
+                    SALES, ["1.2", "1.3"]))
+
+        unassigned = next((r for r in rows
+                           if "not recorded" in (r.get("segment") or "")), None)
+        if unassigned and (unassigned.get("of") or 0) >= ENOUGH_TO_COMPARE:
+            out.append(Question(
+                analysis_key,
+                "What are the deals with no segment recorded against them? "
+                "Are they a part of the business, or is the field simply "
+                "not filled in?",
+                f"{unassigned['of']} closed deals have no value in the "
+                f"field the business is split by.",
+                REVOPS, ["1.2"]))
+    return out
+
+
 def from_analysis(analysis_key: str, output: dict) -> list[Finding]:
     """Everything worth saying from one analysis's output."""
     label = ", ".join(output.get("split_by") or []) or "segment"
@@ -266,6 +342,7 @@ def run(conn, engagement_id: str, heartbeat=None) -> tuple[int, dict]:
     conn.rollback()
 
     findings: list[Finding] = []
+    questions: list[Question] = []
     read, skipped = 0, []
     newest_run = None
     for job_type, run_id, output, accepted in runs:
@@ -276,6 +353,7 @@ def run(conn, engagement_id: str, heartbeat=None) -> tuple[int, dict]:
         read += 1
         newest_run = newest_run or run_id
         findings.extend(from_analysis(key, output))
+        questions.extend(questions_from(key, output))
 
     # The pipelines are not an analysis output: they are rows the
     # detection wrote, and the era comparison reads them directly.
@@ -299,7 +377,9 @@ def run(conn, engagement_id: str, heartbeat=None) -> tuple[int, dict]:
     findings.extend(compare_eras(pipelines, ["5.1", "H04"]))
 
     kept = store(conn, engagement_id, findings, newest_run)
+    asked = store_questions(conn, engagement_id, questions, newest_run)
     return kept, {
+        "questions_for_a_person": asked,
         "analysis": "roll_up",
         "analyses_read": read,
         "analyses_with_no_output": sorted(set(skipped)) or None,
@@ -311,6 +391,29 @@ def run(conn, engagement_id: str, heartbeat=None) -> tuple[int, dict]:
                 "compared across a pipeline change, and a difference "
                 "somebody has already explained is not raised again.",
     }
+
+
+def store_questions(conn, engagement_id: str, questions: list[Question],
+                    run_id: str | None = None) -> int:
+    """Keep the questions, and never ask an answered one again.
+
+    A question somebody has already put to the client and written down
+    the answer to is finished. Raising it again after the analyses re-run
+    would send an interviewer into a room to ask something they have the
+    answer to, which is how a guide stops being read.
+    """
+    with conn.cursor() as cur:
+        cur.executemany("""
+            insert into data_question (engagement_id, analysis_key, question,
+                   because, element_refs, ask_role, source_run_id)
+                 values (%s,%s,%s,%s,%s,%s,%s)
+            on conflict (engagement_id, question) do update
+               set because = excluded.because,
+                   source_run_id = excluded.source_run_id
+             where data_question.answered_at is null
+        """, [q.as_row(engagement_id, run_id) for q in questions])
+    conn.commit()
+    return len(questions)
 
 
 def store(conn, engagement_id: str, findings: list[Finding],
