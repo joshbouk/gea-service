@@ -163,10 +163,30 @@ def parse_export(conn, run_id: str, engagement_id: str, artefact_ids: list[str],
     # The timestamp was the worse half. With it in the parameters no two
     # calls could ever look alike, so the deduplication the database does
     # was switched off by construction.
+    # Only where there is something to match against.
+    #
+    # A drop zone reads five files before anybody says what any of them
+    # are, and proposing mappings over nothing fails five times. The
+    # failure is correct and useless: it reports a state that is the
+    # ordinary beginning of an engagement.
     with conn.cursor() as cur:
-        cur.execute(
-            """select run_id, was_created from gea_enqueue_run(
-                   %s, 'propose_mappings')""", (engagement_id,))
+        cur.execute("""
+            select count(*) from artefact a
+              join dataset d on d.artefact_id = a.id
+             where a.engagement_id = %s and a.purged_at is null
+               and a.export_request_line_id is not null
+               and d.parse_status = 'parsed'
+        """, (engagement_id,))
+        if cur.fetchone()[0]:
+            # Keyed on the files it will read, not on nothing.
+            #
+            # Queued with no key at all, the first proposal an engagement
+            # ever ran answered every request after it: a consultant
+            # placed files three days later and watched nothing happen.
+            # The database function works the key out.
+            cur.execute(
+                "select run_id, was_created from gea_enqueue_mapping_proposals(%s)",
+                (engagement_id,))
     conn.commit()
 
     flagged = sum(1 for p in profiles if p["flags"])
@@ -251,6 +271,27 @@ def propose_mappings(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
     conn.rollback()
 
     if not columns:
+        # Told apart, because the two have different answers. A file read
+        # and not yet placed is the ordinary state of a drop zone, and
+        # "no export has been read" sends somebody to upload what they
+        # already uploaded.
+        with conn.cursor() as cur:
+            cur.execute("""
+                select count(*) from artefact a
+                  join dataset d on d.artefact_id = a.id
+                 where a.engagement_id = %s and a.purged_at is null
+                   and a.export_request_line_id is null
+                   and d.parse_status = 'parsed'
+            """, (engagement_id,))
+            unplaced = cur.fetchone()[0]
+        conn.rollback()
+        if unplaced:
+            raise ValueError(
+                f"{unplaced} file{'' if unplaced == 1 else 's'} ha"
+                f"{'s' if unplaced == 1 else 've'} been read and not yet "
+                f"placed against an export line. A column can only be "
+                f"matched to a field once we know what the file is. Place "
+                f"them on the Files screen and this will run again.")
         raise ValueError(
             "no client export has been read yet, so there are no columns to "
             "match against")

@@ -42,6 +42,7 @@ import psycopg
 
 import analyses
 import rollup
+import identify
 import model
 import realjobs
 import storage
@@ -239,6 +240,22 @@ def work_one(conn: psycopg.Connection) -> bool:
                 "model_name=%s where id=%s",
                 (total, total, json.dumps(output), realjobs.VERSION, run_id))
         conn.commit()
+
+        # Work out what the unplaced files are.
+        #
+        # Over the whole set rather than per file: a batch arrives
+        # together and the first one read has nothing beside it to be
+        # identified against. The database collapses repeat calls, so six
+        # files produce one identification.
+        with conn.cursor() as cur:
+            # Keyed and guarded by the database function, so every
+            # place that queues work is one the verification suite can
+            # check. Written inline here it was correct and invisible to
+            # that check, which is how the other two went wrong.
+            cur.execute("select * from gea_enqueue_identification(%s)",
+                        (engagement_id,))
+        conn.commit()
+
         log(f"succeeded {job_type}  {output['row_count']} rows, "
             f"{output['column_count']} columns, "
             f"{output['malformed_rows']} unreadable")
@@ -325,6 +342,25 @@ def work_one(conn: psycopg.Connection) -> bool:
                     conn.rollback()
                 else:
                     conn.commit()
+        return True
+
+    if job_type == "identify_files":
+        with conn.cursor() as cur:
+            cur.execute("select engagement_id from analysis_run where id = %s",
+                        (run_id,))
+            engagement_id = cur.fetchone()[0]
+        conn.rollback()
+        total, output = identify.identify_everything_unassigned(
+            conn, engagement_id, heartbeat)
+        with conn.cursor() as cur:
+            cur.execute(
+                "update analysis_run set status='succeeded', finished_at=now(), "
+                "progress_done=%s, progress_total=%s, compute_output=%s::jsonb, "
+                "model_name=%s where id=%s",
+                (total, total, json.dumps(output), analyses.VERSION, run_id))
+        conn.commit()
+        log(f"succeeded identify_files  {output['files_looked_at']} looked at, "
+            f"{output.get('settled', 0)} settled")
         return True
 
     if job_type == "roll_up":
