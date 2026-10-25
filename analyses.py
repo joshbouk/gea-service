@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import re
 import csv
+import json
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 
 import csvjobs
 import model
+import pipeline_shape
 import storage
 
 VERSION = "analysis-1"
@@ -38,6 +40,13 @@ VERSION = "analysis-1"
 # we cannot tell you a rate" is a more honest sentence than a rate computed
 # from three.
 MIN_FOR_A_RATE = 10
+
+# What share of a segment's deals must start at its first stage for the
+# thing to be a funnel at all.
+#
+# Below this they are entering partway — a renewals book, where deals are
+# created at Signature — and stage-to-stage conversion describes nothing.
+ENTERS_AT_THE_TOP = 0.4
 
 
 @dataclass
@@ -2596,16 +2605,41 @@ def detect_pipeline(conn, engagement_id: str, heartbeat):
     history = resolve_columns(conn, engagement_id, "stage_conversion_and_duration")
 
 
-    from_history = all(k in history for k in
-                       ("stage_history_opportunity_id", "stage_history_to",
-                        "stage_entered_at"))
+    wants = ("stage_history_opportunity_id", "stage_history_to",
+             "stage_entered_at")
+    have = [k for k in wants if k in history]
+    from_history = len(have) == len(wants)
     heartbeat(0, 3)
 
     if from_history:
         events, source = _stages_from_history(conn, history), "the stage history export"
+        fell_back_because = None
     else:
         events, source = _stages_from_deal_columns(conn, cols), \
             "the date columns on the deals export"
+        # Falling back is not a quiet decision.
+        #
+        # The deals export records the stage a deal left, and a deal
+        # never leaves Closed Won. So this path structurally cannot see
+        # the outcomes: on a real client it found six working stages,
+        # no won, no lost, no qualified out, and reported success. The
+        # consultant believed the client had one pipeline and no losses.
+        #
+        # Where the history export is nearly mapped, say which field is
+        # missing, because that is a two-minute fix and nobody could
+        # have guessed it.
+        missing = [k for k in wants if k not in history]
+        fell_back_because = (
+            f"The stage history export was not used because "
+            f"{' and '.join(missing)} "
+            f"{'is' if len(missing) == 1 else 'are'} not mapped to a "
+            f"column. The deals export was read instead, and it records "
+            f"the stage a deal left rather than where it ended, so the "
+            f"outcomes below are incomplete."
+            if have else
+            "There is no stage history export, so the stage dates on the "
+            "deals export were read instead. Those record movement "
+            "between working stages and not how deals ended.")
     if not events:
         raise ValueError(
             "no stage movement could be read. The stage history export has "
@@ -2622,11 +2656,25 @@ def detect_pipeline(conn, engagement_id: str, heartbeat):
     splits = [(lv["label"], None) for lv in levels]
     heartbeat(2, 3)
 
+    # What the client calls each deal. New business, renewal, add-on:
+    # the one field that says which motion a deal belongs to, and the
+    # thing an earlier version tried to work out from journey shape.
+    deal_type = {}
+    if "opportunity_type" in cols:
+        key = cols["opportunity_id"].column_name
+        kind = cols["opportunity_type"].column_name
+        for row in rows_of(conn, cols["opportunity_type"]):
+            d = (row.get(key) or "").strip()
+            if d:
+                deal_type[d] = (row.get(kind) or "").strip() or None
+
     report = _store_pipelines(conn, engagement_id, events, eras, deal_segment,
-                              [lv["label"] for lv in levels], source)
+                              [lv["label"] for lv in levels], source,
+                              deal_type)
     return sum(len(v) for v in events.values()), {
         "analysis": "detect_pipeline",
         "read_from": source,
+        "incomplete_because": fell_back_because,
         "split_by": [lv["label"] for lv in levels] or None,
         "split_columns_on_another_file": [lv["label"] for lv in levels
                                           if lv.get("unreachable")] or None,
@@ -2827,66 +2875,10 @@ def _positions(ordered_stages) -> dict[str, int]:
     return pos
 
 
-def _fill_in_the_gaps(items, ordered_stages, segment_label):
-    """A deal at stage four was at stage three, whether or not it is written down.
-
-    Two kinds of gap, and they are not equally safe.
-
-    A gap in the middle is certain. A deal recorded at the second stage
-    and again at the fifth was at the third and fourth, whatever the
-    client's hygiene. That is filled always and needs no judgement.
-
-    A gap at the start is not. A renewal that begins at contracting never
-    went through qualification, and on the first real client two hundred
-    and fifty-six auto-renewals started at Contract without one of them
-    ever touching the first stage. So the start is only filled in where
-    the segment's own deals show the pipeline begins at the top.
-
-    The first version made both depend on that evidence, which broke on a
-    stage introduced late: nobody had recorded the new first stage yet, so
-    the test failed and the middle gaps went unfilled too.
-
-    What is never inferred is a date. A stage a deal certainly passed
-    through on a day nobody wrote down supports a conversion rate and
-    supports no duration at all.
-    """
-    working = [(s, d) for s, d in ordered_stages if not _is_outcome(s)]
-    if len(working) < 2:
-        return [], 0.0
-
-    pos = _positions(working)
-    by_place: dict[int, list[str]] = defaultdict(list)
-    for st, pl in pos.items():
-        by_place[pl].append(st)
-    places = sorted(by_place)
-
-    first_place = places[0]
-    at_first = sum(1 for _d, moves in items.items()
-                   if any(m in pos and pos[m] == first_place for m in moves))
-    starts_at_the_top = at_first >= max(3, len(items) * 0.02)
-
-    added = []
-    for deal, moves in items.items():
-        reached = [pos[m] for m in moves if m in pos]
-        if not reached:
-            continue
-        lo, hi = (first_place if starts_at_the_top else min(reached)), max(reached)
-        for pl in places:
-            if pl < lo or pl >= hi:
-                continue
-            if any(pos.get(m) == pl for m in moves):
-                continue
-            # One stage per place, so a pair sharing a number is counted
-            # once. The commoner of the pair is the one to credit.
-            added.append((deal, by_place[pl][0]))
-
-    recorded = sum(len(m) for m in items.values())
-    return added, (len(added) / max(recorded + len(added), 1))
-
-
 def _store_pipelines(conn, engagement_id, events, eras, deal_segment,
-                     split_keys, source) -> list[dict]:
+                     split_keys, source, deal_type=None) -> list[dict]:
     """One pipeline per segment path per era, and the rows beneath them."""
+    deal_type = deal_type or {}
     era_of = {}
     for e in eras:
         for st in e["stages"]:
@@ -2898,8 +2890,45 @@ def _store_pipelines(conn, engagement_id, events, eras, deal_segment,
     for deal, moves in events.items():
         path = deal_segment.get(deal, [])
         levels = [tuple(path[:n]) for n in range(len(path) + 1)] or [()]
-        for m in moves:
-            era = era_of.get(m["stage"], 1)
+
+        # A deal belongs to one era, and takes its whole journey there.
+        #
+        # Assigning each move separately cut a deal that started in May
+        # and closed in July across the boundary: the earlier era saw
+        # three moves of it and the later era four, and neither looked
+        # like a deal that had walked anywhere. On a real client that
+        # happened to a hundred and nineteen of two hundred and forty
+        # deals in one segment, which is why so few classified as having
+        # come through the pipeline — and why outcomes were counted
+        # twice, once in each era.
+        #
+        # The era a deal belongs to is the one its process was in. The
+        # stages it used say that better than a date does: a deal whose
+        # moves are mostly the newer stage set ran on the newer process,
+        # whenever it opened.
+        seen = Counter(era_of.get(m["stage"], 1) for m in moves)
+        era = seen.most_common(1)[0][0] if seen else 1
+
+        # And takes only the moves that used that era's stages.
+        #
+        # Sending the whole journey put the other era's stage names
+        # inside this pipeline: the earlier pipeline grew an Engage
+        # stage from the newer process, and two Closed Won outcomes
+        # appeared, one from each set. A deal that straddles the change
+        # has a tail on the newer process, and that tail belongs to the
+        # newer pipeline's shape, not this one's.
+        # An outcome travels with the deal whatever named it.
+        #
+        # A deal that straddled the change ended on the newer process,
+        # so its win was named "Closed Won" while the pipeline it
+        # belongs to calls that "9 - Closed Won". Dropping it as a
+        # foreign stage lost fifty deals' endings: a hundred and fifty
+        # deals and a hundred outcomes. The numbering is the process's;
+        # the ending is the deal's, so outcomes are matched on their
+        # name with any stage number taken off.
+        mine = [m for m in moves
+                if era_of.get(m["stage"], 1) == era or _is_outcome(m["stage"])]
+        for m in mine:
             for lv in levels:
                 buckets[(lv, era)].append((deal, m))
 
@@ -2933,59 +2962,111 @@ def _store_pipelines(conn, engagement_id, events, eras, deal_segment,
             per_stage, aliases = _merge_shared_numbers(per_stage)
             ordered = _order_stages(per_stage)
 
-            # A deal that reached stage four was at stage three.
+            # Which motion each deal belongs to, as the client records
+            # it. The funnel is the new business; the renewals and the
+            # add-ons are counted beside it.
             renamed = {old: main for main, olds in aliases.items()
                        for old in olds}
-            by_deal: dict[str, set] = defaultdict(set)
-            for d, m in items:
-                by_deal[d].add(renamed.get(m["stage"], m["stage"]))
-            inferred, inferred_share = _fill_in_the_gaps(by_deal, ordered, label)
-            counts = {st: len(d) for st, d in per_stage.items()}
-            for _d, st in inferred:
-                counts[st] = counts.get(st, 0) + 1
-            # The happy path first, then the ways a deal leaks out of it.
-            #
-            # Outcomes were ordered among themselves by when they
-            # happened, which put Closed Lost before Closed Won on a
-            # client whose new pipeline numbers none of them. A funnel
-            # reads as a route to a win, and a loss drawn before the win
-            # makes every rate beside it read as the wrong thing.
             ordered = ([(st, d) for st, d in ordered if not _is_outcome(st)]
                        + sorted(((st, d) for st, d in ordered if _is_outcome(st)),
                                 key=lambda kv: (outcome(kv[0]) != "won",
                                                 -len(kv[1]))))
             working = [(st, d) for st, d in ordered if not _is_outcome(st)]
             pos = _positions(working)
-            prev_at_place: dict[int, int] = {}
+            at_place = {}
             for st, _d in working:
-                pl = pos[st]
-                prev_at_place[pl] = max(prev_at_place.get(pl, 0),
-                                        counts.get(st, 0))
-            places = sorted(prev_at_place)
-            reached_the_end = prev_at_place[places[-1]] if places else 0
+                at_place.setdefault(pos[st], st)
+            places = sorted(at_place)
+            if not places:
+                continue
+            first_place = places[0]
 
-            for i, (stage, dates) in enumerate(ordered, 1):
-                mid = sorted(dates)[len(dates) // 2]
-                here = counts.get(stage, len(dates))
-                # Of the deals that reached the stage before, how many
-                # reached this one. The number the funnel exists to give.
-                if _is_outcome(stage):
-                    # Of every deal in the pipeline, not of the deals that
-                    # reached the last stage.
-                    #
-                    # A deal is qualified out at the first stage, not
-                    # after the last one, so dividing by the deals that
-                    # got to the end gave shares above a hundred per cent
-                    # — two hundred and fifty-six, on a real client. For
-                    # the win this is the win rate, which is the number
-                    # the whole funnel exists to produce.
-                    before = deals
-                else:
-                    pl = pos.get(stage)
-                    earlier = [p for p in places if pl is not None and p < pl]
-                    before = prev_at_place[earlier[-1]] if earlier else None
-                conversion = (round(here / before, 4)
-                              if before else None)
+            journeys = {}
+            outcome_of = {}
+            for d, m in items:
+                st = renamed.get(m["stage"], m["stage"])
+                j = journeys.setdefault(
+                    d, pipeline_shape.Deal(d, deal_type.get(d)))
+                if _is_outcome(st):
+                    # Without its number, so the two processes' spellings
+                    # of the same ending are one row rather than two.
+                    outcome_of[d] = _without_number(st)
+                    continue
+                place = pos.get(st)
+                if place is None:
+                    continue
+                if place not in j.at or (m["when"] is not None
+                                         and (j.at[place] is None
+                                              or m["when"] < j.at[place])):
+                    j.at[place] = m["when"]
+
+            populations = pipeline_shape.split_by_motion(journeys)
+            the_funnel = populations.get(pipeline_shape.THE_FUNNEL, [])
+            # Where the client does not label deal types, everything is
+            # unlabelled and the funnel would be empty. Falling back to
+            # every deal is better than an empty screen, and the count
+            # of unlabelled deals says why the picture is mixed.
+            if not the_funnel:
+                the_funnel = list(journeys.values())
+            measured = pipeline_shape.measure(the_funnel, places, first_place)
+            shape = pipeline_shape.describe(
+                populations, lambda pl: at_place.get(pl, str(pl)))
+
+            recorded = sum(len(j.at) for j in the_funnel)
+            passed = sum(len(pipeline_shape.through(j, places, first_place))
+                         for j in the_funnel)
+            inferred_share = (passed - recorded) / max(passed, 1)
+
+            cur.execute("""
+                update pipeline
+                   set stage_records_inferred = %s,
+                       deals = %s,
+                       deals_with_any_stage_date = %s,
+                       new_business = %s, renewals = %s, expansion = %s,
+                       not_labelled = %s,
+                       other_motions = %s::jsonb
+                 where id = %s
+            """, (round(inferred_share, 4), len(the_funnel),
+                  sum(1 for j in the_funnel if j.at),
+                  shape["new_business"], shape["renewals"],
+                  shape["expansion"], shape["not_labelled"],
+                  json.dumps({"renewals_start_at": shape["renewals_start_at"],
+                              "expansion_starts_at": shape["expansion_starts_at"]}),
+                  pid))
+
+            in_funnel = {j.deal_id for j in the_funnel}
+            for i, place in enumerate(places, 1):
+                stage = at_place[place]
+                r = measured.get(place, {})
+                dates = [w for j in the_funnel for pl, w in j.at.items()
+                         if pl == place and w is not None]
+                cur.execute("""
+                    insert into pipeline_stage (pipeline_id, stage_name,
+                           position, source_column, deals_entered,
+                           deals_recorded, median_entered, is_closed_won,
+                           is_closed_lost, stage_number, date_kind,
+                           is_outcome, conversion_from_previous,
+                           median_days_here, days_measured_on)
+                         values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (pid, stage, i, source, r.get("reached", 0),
+                      r.get("recorded", 0),
+                      sorted(dates)[len(dates) // 2] if dates else None,
+                      False, False, _stage_number(stage), "entered",
+                      False, r.get("conversion"),
+                      r.get("median_days"), r.get("days_from") or None))
+
+            # Collapsed by name, so "9 - Closed Won" and "Closed Won"
+            # are one outcome.
+            merged_outcomes: dict = {}
+            for st, d in ordered:
+                if _is_outcome(st):
+                    merged_outcomes.setdefault(_without_number(st), []).extend(d)
+            outcomes = sorted(merged_outcomes.items(),
+                              key=lambda kv: (outcome(kv[0]) != "won",
+                                              -len(kv[1])))
+            for i, (stage, dates) in enumerate(outcomes, len(places) + 1):
+                here = sum(1 for d, s2 in outcome_of.items()
+                           if s2 == stage and d in in_funnel)
                 cur.execute("""
                     insert into pipeline_stage (pipeline_id, stage_name,
                            position, source_column, deals_entered,
@@ -2993,38 +3074,46 @@ def _store_pipelines(conn, engagement_id, events, eras, deal_segment,
                            is_closed_lost, stage_number, date_kind,
                            is_outcome, conversion_from_previous)
                          values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """, (pid, stage, i, source, here, len(dates), mid,
+                """, (pid, stage, i, source, here, here,
+                      sorted(dates)[len(dates) // 2] if dates else None,
                       outcome(stage) == "won", outcome(stage) == "lost",
-                      _stage_number(stage), "entered",
-                      _is_outcome(stage), conversion))
-
-            if not path:
-                cur.executemany("""
-                    insert into deal_stage_entry (engagement_id,
-                           opportunity_id, segment, stage_name, entered_at,
-                           era)
-                         values (%s,%s,%s,%s,%s,%s)
-                    on conflict do nothing
-                """, [(engagement_id, d, label, m["stage"], m["when"], era)
-                      for d, m in items])
-
-            cur.execute("""
-                update pipeline set stage_records_inferred = %s where id = %s
-            """, (round(inferred_share, 4), pid))
+                      _stage_number(stage), "entered", True,
+                      round(here / len(the_funnel), 4) if the_funnel else None))
 
             report.append({
                 "segment": label, "depth": len(path), "era": era,
                 "deals": deals, "entries": len(items),
                 "share_of_stage_records_inferred": round(inferred_share, 4),
-                "stages": [{"stage": s, "position": i,
-                            "deals_entered": counts.get(s, len(d)),
-                            "deals_recorded": len(d),
-                            "is_outcome": _is_outcome(s),
-                            "also_called": aliases.get(s)}
-                           for i, (s, d) in enumerate(ordered, 1)],
+                # What the deals in this segment are, before anything
+                # about conversion. On a mixed segment this is the
+                # finding: a sales funnel and a renewals book sharing a
+                # column.
+                "new_business": shape["new_business"],
+                "renewals": shape["renewals"],
+                "expansion": shape["expansion"],
+                "not_labelled": shape["not_labelled"],
+                "renewals_start_at": shape["renewals_start_at"],
+                "stages": [{"stage": at_place[pl], "position": i,
+                            "deals_entered": measured.get(pl, {}).get("reached", 0),
+                            "deals_recorded": measured.get(pl, {}).get("recorded", 0),
+                            "conversion": measured.get(pl, {}).get("conversion"),
+                            "median_days": measured.get(pl, {}).get("median_days"),
+                            "is_outcome": False,
+                            "also_called": aliases.get(at_place[pl])}
+                           for i, pl in enumerate(places, 1)],
             })
     conn.commit()
     return report
+
+
+def _without_number(stage: str) -> str:
+    """"9 - Closed Won" and "Closed Won" are the same ending.
+
+    Two processes number their stages differently and name their
+    endings the same. The number belongs to the process; the ending
+    belongs to the deal.
+    """
+    return re.sub(r"^\s*\d{1,2}\s*[-–—.:)]\s*", "", stage or "").strip()
 
 
 def _stage_number(stage: str):
