@@ -30,6 +30,7 @@ through; it is never abandoned half done.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import random
@@ -299,12 +300,29 @@ def work_one(conn: psycopg.Connection) -> bool:
            else job_type)
     if key in analyses.BUILT:
         with conn.cursor() as cur:
-            cur.execute("select engagement_id from analysis_run where id = %s",
-                        (run_id,))
-            engagement_id = cur.fetchone()[0]
+            cur.execute("select engagement_id, coalesce(parameters, '{}'::jsonb) "
+                        "from analysis_run where id = %s", (run_id,))
+            engagement_id, parameters = cur.fetchone()
         conn.rollback()
+
+        # What the run was queued with, handed to the analysis that
+        # understands it.
+        #
+        # The parameters were being dropped. Synthesising an interview
+        # takes an interview_id, the app queued one with every run, and
+        # the worker called the function without it — so the analysis
+        # looked across the whole engagement every time and found
+        # nothing, because the app had already linked the interview to
+        # this very run. The argument had existed since the function was
+        # written and nothing ever supplied it.
+        #
+        # Only arguments the function actually declares are passed, so a
+        # run carrying something unexpected does not break a call.
+        takes = set(inspect.signature(analyses.BUILT[key]).parameters)
+        extra = {k: v for k, v in (parameters or {}).items() if k in takes}
         try:
-            total, output = analyses.BUILT[key](conn, engagement_id, heartbeat)
+            total, output = analyses.BUILT[key](conn, engagement_id, heartbeat,
+                                                **extra)
         except (ValueError, storage.StorageError) as exc:
             conn.rollback()
             with conn.cursor() as cur:
