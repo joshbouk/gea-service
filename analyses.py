@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 
 import csvjobs
 import model
+import interview
 import pipeline_shape
 import storage
 
@@ -2421,38 +2422,28 @@ def adversarial_score_review(conn, engagement_id: str, heartbeat):
     }
 
 
-def synthesise_interview(conn, engagement_id: str, heartbeat, interview_id=None):
-    """Read a conversation against the questions it was meant to cover.
+def synthesise_interview(conn, engagement_id: str, heartbeat,
+                         interview_id=None) -> tuple[int, dict]:
+    """Read a conversation the way the consultant who held it would.
 
-    Forty minutes of talk, twenty to fifty questions, and a consultant who
-    needs to find the part that bears on element 5.3. That is the whole job.
+    Five readings of the whole transcript, each with one job, rather
+    than one reading per guide question. The previous version asked
+    three yes-or-no questions about each of thirty questions and
+    produced a coverage check that missed everything volunteered — and
+    people volunteer most of what matters, because they are talking
+    rather than being surveyed.
 
-    It does not propose a score. Nothing here says what an element is worth,
-    and the elements an interview serves are scored by a person who read it.
-    The synthesis exists so they can find what they are looking for.
-
-    Three outputs, and the second two are the ones worth having:
-
-      What was said, per question, in the words that were said. A claim
-      without the words is the model's summary, and a summary cannot be
-      cited.
-
-      What was never discussed. A guide has questions for a reason, and a
-      question nobody asked is a gap in the evidence rather than a silence
-      about the client. Consultants run out of time and skip the last ten
-      minutes; this is what notices.
-
-      Where the answer did not answer. Not a claim that somebody was hiding
-      something — that is a judgement nobody should delegate — but a flag
-      that the words given did not address what was asked, so a person can
-      decide for themselves.
+    It proposes no score. Nothing here says what an element is worth.
+    The job is to put an hour of talk in front of somebody in a form
+    they can act on, with the words that were said and a mark saying
+    whether those words are really in the transcript.
     """
     model.check_configured()
 
     with conn.cursor() as cur:
         cur.execute("""
             select i.id, i.interviewee_name, i.interviewee_role,
-                   g.ref, g.function_name, a.storage_path, a.original_filename
+                   g.ref, g.function_name, a.storage_path
               from interview i
               join interview_guide g on g.id = i.interview_guide_id
               left join artefact a on a.id = i.transcript_artefact_id
@@ -2460,10 +2451,10 @@ def synthesise_interview(conn, engagement_id: str, heartbeat, interview_id=None)
              where i.engagement_id = %s
                and (%s::uuid is null or i.id = %s::uuid)
                and i.status = 'held'
-               and i.synthesis_run_id is null
+               and (%s::uuid is not null or i.synthesis_run_id is null)
              order by i.held_at nulls last
              limit 1
-        """, (engagement_id, interview_id, interview_id))
+        """, (engagement_id, interview_id, interview_id, interview_id))
         row = cur.fetchone()
     conn.rollback()
 
@@ -2471,113 +2462,179 @@ def synthesise_interview(conn, engagement_id: str, heartbeat, interview_id=None)
         raise ValueError(
             "there is no interview waiting to be read. One has to be marked "
             "held before its transcript can be synthesised")
-    iid, who, role, guide_ref, function_name, path, filename = row
+    iid, who, role, guide_ref, function_name, path = row
     if path is None:
         raise ValueError(
             f"the {function_name} interview has no transcript attached, so "
             f"there is nothing to read. Attach it and try again")
 
-    with conn.cursor() as cur:
-        cur.execute("select * from gea_interview_guide_questions(%s)", (iid,))
-        questions = [{"id": r[0], "section": r[1], "text": r[2], "elements": r[3]}
-                     for r in cur.fetchall()]
-    conn.rollback()
-
     with storage.download(path).open("r", encoding="utf-8",
                                      errors="replace") as fh:
         transcript = fh.read()
-    if len(transcript.split()) < 200:
+    spoken = interview.turns(transcript)
+    words = sum(len(t.split()) for _a, _b, _c, t in spoken)
+    if words < 200:
         raise ValueError(
-            f"that transcript is {len(transcript.split())} words, which is "
-            f"too short to be a conversation. Check the right file is "
-            f"attached")
+            f"that transcript is {words} words of conversation, which is too "
+            f"short to read. Check the right file is attached")
 
-    # The transcript goes with every batch of questions. It is the thing
-    # being read, and a question judged against part of a conversation is
-    # judged against the wrong thing.
-    LABELS = ["was_asked", "was_answered", "the_answer_addressed_the_question"]
-    records = [{"id": q["id"],
-                "text": (f"QUESTION: {q['text']}\n"
-                         + (f"SECTION: {q['section']}\n" if q["section"] else "")
-                         + "\n--- THE TRANSCRIPT ---\n" + transcript[:60000])}
-               for q in questions]
+    # What this conversation is being read against: the elements its
+    # guide serves, what the data has already suggested, who else is
+    # being spoken to, and what the guide meant to cover.
+    with conn.cursor() as cur:
+        cur.execute("""
+            select distinct e.ref, e.name
+              from interview_question q
+              join interview_guide g on g.id = q.interview_guide_id
+              join interview_question_element qe on qe.interview_question_id = q.id
+              join element e on e.id = qe.element_id
+             where g.ref = %s
+               and g.instrument_version_id = (
+                     select instrument_version_id from engagement where id = %s)
+             order by e.ref
+        """, (guide_ref, engagement_id))
+        elements = [{"ref": r[0], "name": r[1]} for r in cur.fetchall()]
 
-    labelled, unread = model.classify(
-        records,
-        f"Each record is one question from the {function_name} interview "
-        f"guide, followed by the transcript of that conversation with "
-        f"{who}{', ' + role if role else ''}.\n\n"
-        "For each question, answer:\n"
-        "- was_asked: the question, or something close enough to it, was put "
-        "to the interviewee.\n"
-        "- was_answered: they said something in response.\n"
-        "- the_answer_addressed_the_question: what they said actually bears "
-        "on what was asked. Answer no where they talked about something "
-        "else, gave a generality, or deferred to somebody not present. This "
-        "is not a claim that they were evasive; it is a flag for a person to "
-        "judge.\n\n"
-        "Your evidence quotation must be the interviewee's own words from "
-        "the transcript, under fifteen words, and must be the part that "
-        "answers the question where there is one. Where the question was "
-        "never put, quote nothing and say so with an empty evidence string "
-        "is not permitted — quote the nearest thing that was discussed "
-        "instead.\n\n"
-        "Never say what any of this is worth. You are not scoring anything.",
-        LABELS, heartbeat=heartbeat)
+        cur.execute("""
+            select headline, detail from rollup_finding
+             where engagement_id = %s and dismissed_at is null
+             order by created_at desc limit 25
+        """, (engagement_id,))
+        # The headline alone. The detail is structured data for a
+        # screen, not a sentence a model should be asked to weigh.
+        beliefs = [{"claim": r[0]} for r in cur.fetchall()]
 
-    by_id = {q["id"]: q for q in questions}
-    covered, never_asked, not_addressed = [], [], []
-    for qid, v in labelled.items():
-        q = by_id[qid]
-        entry = {"question": q["text"], "elements": q["elements"],
-                 "said": v["evidence"], "confidence": v["confidence"]}
-        if v["labels"]["was_asked"] == "no":
-            never_asked.append({"question": q["text"],
-                                "elements": q["elements"]})
-        elif v["labels"]["the_answer_addressed_the_question"] == "no":
-            not_addressed.append(entry)
-        elif v["labels"]["was_answered"] == "yes":
-            covered.append(entry)
+        cur.execute("""
+            select interviewee_name, interviewee_role, held_at is not null
+              from interview
+             where engagement_id = %s and id <> %s
+               and interviewee_name is not null and status <> 'declined'
+             order by scheduled_at nulls last
+        """, (engagement_id, iid))
+        others = [{"name": r[0], "role": r[1], "held": r[2]}
+                  for r in cur.fetchall()]
 
-    # Which elements this conversation actually reached. An element whose
-    # every question went unasked is not evidenced by this interview, and
-    # saying so is the difference between a gap somebody can close and one
-    # nobody notices until the scoring.
-    reached, missed = set(), set()
-    for q in questions:
-        for e in q["elements"]:
-            if any(x["question"] == q["text"] for x in covered):
-                reached.add(e)
-    for q in questions:
-        for e in q["elements"]:
-            if e not in reached:
-                missed.add(e)
+        cur.execute("select * from gea_interview_guide_questions(%s)", (iid,))
+        questions = [{"id": r[0], "text": r[2], "elements": r[3] or []}
+                     for r in cur.fetchall()]
 
-    return len(covered), {
+        cur.execute("""
+            select distinct name from (
+              select interviewee_name as name from interview
+               where engagement_id = %s and interviewee_name is not null
+              union
+              select unnest(coalesce(systems, array[]::text[]))
+                from engagement where id = %s
+            ) x where name is not null
+        """, (engagement_id, engagement_id))
+        known = {"names": [r[0] for r in cur.fetchall()]}
+    conn.rollback()
+
+    # Five readings. Each gets the whole conversation, because a claim
+    # judged against part of one is judged against the wrong thing.
+    heartbeat(0, 5)
+    learned = interview.what_was_learned(transcript, who, role, elements)
+    heartbeat(1, 5)
+    corrects = interview.what_this_corrects(transcript, who, beliefs)
+    heartbeat(2, 5)
+    fresh = interview.what_is_new(transcript, known)
+    heartbeat(3, 5)
+    next_up = interview.what_to_ask_next(transcript, who, others)
+    heartbeat(4, 5)
+    covered = interview.coverage(transcript, questions)
+    heartbeat(5, 5)
+
+    CHECK = {"verified": "verified",
+             "no quotation": "no_quote",
+             "not in the transcript": "not_found",
+             "not said by one person; it runs across a speaker change":
+                 "stitched"}
+
+    def checked(claim):
+        said = interview.verify(claim, spoken)
+        return CHECK.get(said, "misplaced"), said
+
+    rows, counts = [], defaultdict(int)
+    for r in learned:
+        mark, _ = checked(r)
+        counts[mark] += 1
+        rows.append(("learned", (r.get("what") or "")[:400], None,
+                     [r.get("element")] if r.get("element") else [],
+                     r.get("element"), None, r.get("quote"), r.get("at"),
+                     mark, r.get("how_sure")))
+    for r in corrects:
+        mark, _ = checked(r)
+        counts[mark] += 1
+        rows.append(("corrects", (r.get("what_they_said") or "")[:400], None,
+                     [], r.get("belief"), r.get("verdict"),
+                     r.get("quote"), r.get("at"), mark, None))
+    for r in fresh:
+        mark, _ = checked(r)
+        counts[mark] += 1
+        rows.append(("new", (r.get("what") or "")[:400], None, [],
+                     r.get("name"), r.get("kind"), r.get("quote"),
+                     r.get("at"), mark, r.get("worth_chasing")))
+    for r in next_up:
+        mark, _ = checked(r)
+        counts[mark] += 1
+        rows.append(("ask_next", (r.get("question") or "")[:400],
+                     r.get("because"), [], r.get("who"), None,
+                     r.get("quote"), r.get("at"), mark, None))
+
+    with conn.cursor() as cur:
+        cur.execute("delete from interview_finding where interview_id = %s",
+                    (iid,))
+        for kind, head, detail, els, about, verdict, q, at, mark, sure in rows:
+            if not (head or "").strip():
+                continue
+            cur.execute("""
+                insert into interview_finding (engagement_id, interview_id,
+                       kind, headline, detail, element_refs, about, verdict,
+                       said_by, quote, said_at, quote_is, how_sure)
+                     values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (engagement_id, iid, kind, head, detail,
+                  [e for e in els if e], about, verdict, who, q, at,
+                  mark, sure))
+
+        cur.execute("delete from interview_coverage where interview_id = %s",
+                    (iid,))
+        by_ref = {q["id"]: q for q in questions}
+        asked = 0
+        for r in covered:
+            q = by_ref.get(r.get("id"))
+            if q is None:
+                continue
+            mark, _ = checked(r)
+            asked += 1 if str(r.get("asked", "")).lower() == "yes" else 0
+            cur.execute("""
+                insert into interview_coverage (interview_id, question_ref,
+                       question_text, element_refs, asked, answered, quote,
+                       said_at, quote_is)
+                     values (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                on conflict (interview_id, question_ref) do nothing
+            """, (iid, q["id"], q["text"], q["elements"],
+                  str(r.get("asked", "")).lower() == "yes",
+                  r.get("answered"), r.get("quote"), r.get("at"), mark))
+    conn.commit()
+
+    return len(rows), {
         "analysis": "synthesise_interview",
-        "interview": {"guide": guide_ref, "function": function_name,
-                      "interviewee": who, "role": role,
-                      "transcript": filename,
-                      "words": len(transcript.split())},
-        "population": {
-            "questions_in_the_guide": len(questions),
-            "questions_read": len(labelled),
-            "questions_the_model_did_not_return": len(unread),
-        },
-        "what_was_said": covered,
-        "never_asked": never_asked,
-        "asked_but_not_addressed": not_addressed,
-        "elements_this_conversation_reached": sorted(reached),
-        "elements_it_did_not": sorted(missed),
-        "complete": not unread,
-        "model": model.MODEL,
-        "note": "Nothing here is a score. It is what was said, against the "
-                "questions the guide asks, in the words that were said. A "
-                "question nobody put is a gap in the evidence, not a silence "
-                "about the client. An answer flagged as not addressing the "
-                "question is for a person to judge, not an accusation.",
+        "interview": who,
+        "role": role,
+        "guide": function_name,
+        "words_of_conversation": words,
+        "turns": len(spoken),
+        "what_it_established": sum(1 for r in rows if r[0] == "learned"),
+        "what_it_corrects": sum(1 for r in rows if r[0] == "corrects"),
+        "what_is_new": sum(1 for r in rows if r[0] == "new"),
+        "to_ask_elsewhere": sum(1 for r in rows if r[0] == "ask_next"),
+        "questions_in_the_guide": len(questions),
+        "questions_put": asked,
+        # The count that decides whether any of this is usable. A
+        # reading that quotes well and quotes wrongly is worse than one
+        # that quotes nothing, so it is reported rather than hidden.
+        "quotations": dict(counts),
     }
-
 
 def detect_pipeline(conn, engagement_id: str, heartbeat):
     """Find the pipelines the client actually runs.
