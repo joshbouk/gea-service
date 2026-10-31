@@ -32,7 +32,9 @@ from dataclasses import dataclass, field
 import csvjobs
 import model
 import interview
+import deal_value
 import pipeline_shape
+import qualification
 import storage
 
 VERSION = "analysis-1"
@@ -457,14 +459,29 @@ class Cut:
     counts: Counter = field(default_factory=Counter)
     non_answers: Counter = field(default_factory=Counter)
     missing: int = 0
+    # What the records in each bucket are worth, where the client
+    # records a value. Counting deals answers half the question: a
+    # channel producing two opportunities from fifty-six has a problem,
+    # and whether those two were worth four hundred thousand or four
+    # thousand decides how big a problem and where the money should
+    # have gone. Carried here rather than beside, because a count and
+    # its value are two halves of one answer and separating them lets a
+    # reader quote whichever suits.
+    worth: dict = field(default_factory=lambda: defaultdict(float))
+    priced: Counter = field(default_factory=Counter)
 
-    def add(self, value: str | None) -> None:
+    def add(self, value: str | None, amount: float | None = None) -> None:
         if value is None or str(value).strip() == "":
             self.missing += 1
-        elif is_a_non_answer(value):
-            self.non_answers[str(value).strip()] += 1
-        else:
-            self.counts[str(value).strip()] += 1
+            return
+        clean = str(value).strip()
+        if is_a_non_answer(value):
+            self.non_answers[clean] += 1
+            return
+        self.counts[clean] += 1
+        if amount is not None:
+            self.worth[clean] += amount
+            self.priced[clean] += 1
 
     @property
     def answered(self) -> int:
@@ -477,11 +494,24 @@ class Cut:
     def as_dict(self, total: int) -> dict:
         known = self.answered
         rows = []
-        for value, n in self.counts.most_common():
+        any_value = bool(self.priced)
+        # Ordered by value where there is any, because the question
+        # behind most of these is where the money is.
+        order = (sorted(self.counts, key=lambda v: -self.worth[v]) if any_value
+                 else [v for v, _n in self.counts.most_common()])
+        for value in order:
+            n = self.counts[value]
             row = {"value": value, "count": n, "of": known}
             # A share computed from nine records is not a share.
             if known >= MIN_FOR_A_RATE:
                 row["share"] = round(n / known, 4)
+            if any_value:
+                row["value_total"] = round(self.worth[value], 2)
+                # What that total covers. A figure over nine of forty
+                # records is a real number about nine records.
+                row["priced"] = self.priced[value]
+                row["mean"] = (round(self.worth[value] / self.priced[value], 2)
+                               if self.priced[value] >= MIN_FOR_A_RATE else None)
             rows.append(row)
         held = sum(self.non_answers.values())
         return {
@@ -496,6 +526,9 @@ class Cut:
             "non_answers_used": [{"value": v, "count": n}
                                  for v, n in self.non_answers.most_common()],
             "suppressed": known < MIN_FOR_A_RATE,
+            **({"total_value": round(sum(self.worth.values()), 2),
+                "records_with_a_value": sum(self.priced.values())}
+               if self.priced else {}),
             "values": rows,
         }
 
@@ -536,17 +569,25 @@ def firmographic_cuts(cols: dict[str, Column]) -> tuple[dict[str, Cut], list[str
             [n for n, k in dims if k not in cols])
 
 
-def add_firmographics(cuts: dict[str, Cut], acct: dict) -> None:
+def add_firmographics(cuts: dict[str, Cut], acct: dict,
+                      amount: float | None = None) -> None:
+    """One account's firmographics into every cut, with what it is worth.
+
+    The amount is optional because a client may not record deal value,
+    and every cut still has to work without it.
+    """
     if "industry" in cuts:
-        cuts["industry"].add(acct.get("industry"))
+        cuts["industry"].add(acct.get("industry"), amount)
     if "country" in cuts:
-        cuts["country"].add(acct.get("country"))
+        cuts["country"].add(acct.get("country"), amount)
     if "employee band" in cuts:
-        cuts["employee band"].add(_band(acct.get("employees"), EMPLOYEE_BANDS))
+        cuts["employee band"].add(_band(acct.get("employees"), EMPLOYEE_BANDS),
+                                  amount)
     if "revenue band" in cuts:
-        cuts["revenue band"].add(_band(acct.get("revenue"), REVENUE_BANDS))
+        cuts["revenue band"].add(_band(acct.get("revenue"), REVENUE_BANDS),
+                                 amount)
     if "segment" in cuts:
-        cuts["segment"].add(acct.get("segment"))
+        cuts["segment"].add(acct.get("segment"), amount)
 
 
 def money(value) -> float | None:
@@ -683,6 +724,11 @@ def icp_reconciliation(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
     # "0 with a value, 362 without" on an unmapped field says the client
     # leaves it blank, when the truth is that nobody looked. Those are
     # different findings and must not look alike.
+    # What each won deal is worth. Who buys is one answer; who buys
+    # the big ones is another, and a client whose best logos are
+    # its smallest deals has a positioning problem the count hides.
+    worth = deal_value.by_deal(conn, cols, rows_of)
+
     cuts, not_cut = firmographic_cuts(cols)
     deals = won_deals = no_account = unmatched = 0
 
@@ -704,7 +750,7 @@ def icp_reconciliation(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
                 unmatched += 1
                 continue
 
-            add_firmographics(cuts, acct)
+            add_firmographics(cuts, acct, worth.get(deal))
     heartbeat(2, 2)
 
     seen.refuse_if_nothing_matched(cols["opportunity_status"].column_name)
@@ -762,6 +808,11 @@ def win_loss_and_churn_patterns(conn, engagement_id: str, heartbeat):
     if problem:
         raise ValueError(problem)
 
+    # What each deal is worth, where the client records it. A win rate
+    # and a share of value are different findings and a reader who sees
+    # one will reach for the other.
+    worth = deal_value.by_deal(conn, cols, rows_of)
+
     seen = Outcomes()
     heartbeat(0, 2)
     accounts = load_accounts(conn, cols)
@@ -777,6 +828,7 @@ def win_loss_and_churn_patterns(conn, engagement_id: str, heartbeat):
     loss_reasons, win_reasons, competitors = Cut("loss reason"), Cut("win reason"), Cut("competitor named")
 
     deals = won = lost = unqualified = open_deals = no_account = unmatched = 0
+    won_value = lost_value = 0.0
     status_col = cols["opportunity_status"].column_name
     account_col = cols["opportunity_account_id"].column_name
 
@@ -793,15 +845,21 @@ def win_loss_and_churn_patterns(conn, engagement_id: str, heartbeat):
             if result == "unqualified":
                 unqualified += 1
                 continue
+            amount = worth.get((row.get(id_col) or "").strip())
             if result == "won":
                 won += 1
+                if amount is not None:
+                    won_value += amount
                 if "win_reason" in cols:
-                    win_reasons.add(row.get(cols["win_reason"].column_name))
+                    win_reasons.add(row.get(cols["win_reason"].column_name), amount)
             else:
                 lost += 1
-                loss_reasons.add(row.get(cols["loss_reason"].column_name))
+                if amount is not None:
+                    lost_value += amount
+                loss_reasons.add(row.get(cols["loss_reason"].column_name), amount)
                 if "competitor_named" in cols:
-                    competitors.add(row.get(cols["competitor_named"].column_name))
+                    competitors.add(row.get(cols["competitor_named"].column_name),
+                                    amount)
 
             key = (row.get(account_col) or "").strip()
             if not key:
@@ -811,7 +869,8 @@ def win_loss_and_churn_patterns(conn, engagement_id: str, heartbeat):
             if acct is None:
                 unmatched += 1
                 continue
-            add_firmographics(won_cuts if result == "won" else lost_cuts, acct)
+            add_firmographics(won_cuts if result == "won" else lost_cuts,
+                              acct, amount)
     heartbeat(2, 2)
 
     seen.refuse_if_nothing_matched(cols["opportunity_status"].column_name)
@@ -824,6 +883,12 @@ def win_loss_and_churn_patterns(conn, engagement_id: str, heartbeat):
     # they opened turn into revenue.
     of_everything_closed = (round(won / closed, 4)
                             if closed >= MIN_FOR_A_RATE else None)
+    # The same question asked of the money. A client winning half its
+    # deals and a fifth of the value on the table is losing the big
+    # ones, and the count alone will not say so.
+    decided_value = won_value + lost_value
+    win_rate_by_value = (round(won_value / decided_value, 4)
+                         if decided_value > 0 else None)
 
     # Where the win rate differs most from the overall rate. Reported with
     # both counts, because a cut of twelve records swinging twenty points is
@@ -858,6 +923,17 @@ def win_loss_and_churn_patterns(conn, engagement_id: str, heartbeat):
         **by_segment.as_dict("won", ("won", "lost", "unqualified")),
         "win_rate_against_decided": overall,
         "win_rate_against_everything_closed": of_everything_closed,
+        # The same question asked of the money, where the client records
+        # it. A client winning half its deals and a fifth of the value
+        # on the table is losing the big ones, and the count alone will
+        # not say so.
+        **({"value_won": round(won_value, 2),
+            "value_lost": round(lost_value, 2),
+            "win_rate_by_value": win_rate_by_value}
+           if (won_value or lost_value) else
+           {"value_not_recorded": "no deal value is mapped, so this is "
+                                  "about how many deals rather than how "
+                                  "much they were worth"}),
         "decided_means": "won or lost to somebody else",
         "closed_means": "won, lost, or closed by the seller as unqualified",
         "widest_variance": variance[:3],
@@ -1232,8 +1308,26 @@ def cost_per_qualified_opportunity(conn, engagement_id: str, heartbeat):
     tell which far faster than we can.
     """
     cols = resolve_columns(conn, engagement_id, "cost_per_qualified_opportunity")
-    needed = ["opportunity_id", "channel_source", "qualified_at",
+
+    # When a deal became qualified is nominated rather than mapped.
+    #
+    # No export holds it: qualification is a stage the business treats
+    # as the point a deal counts, and which stage that is differs by
+    # client and changes when a process is rebuilt. A consultant
+    # nominates it per pipeline and the date is read from the stage
+    # history already in hand.
+    #
+    # A mapped column still wins where one exists, because a client who
+    # does record the date knows better than we do.
+    became, counted = qualification.when_qualified(conn, engagement_id)
+    needed = ["opportunity_id", "channel_source",
               "spend_amount", "spend_channel", "spend_month"]
+    if "qualified_at" not in cols and not became:
+        raise ValueError(
+            "nothing says when a deal became qualified. Either map "
+            "qualified_at to a column, or nominate the stage that counts "
+            "as qualified on each pipeline, which is the usual answer "
+            "because no export holds the date")
     problem = missing_fields(conn, engagement_id, "cost_per_qualified_opportunity", needed, cols)
     if problem:
         raise ValueError(problem)
@@ -1265,7 +1359,10 @@ def cost_per_qualified_opportunity(conn, engagement_id: str, heartbeat):
     deals = no_qualified_date = no_channel = 0
     for row in rows_of(conn, cols["opportunity_id"]):
             deals += 1
-            month = a_month(row.get(cols["qualified_at"].column_name))
+            deal = (row.get(cols["opportunity_id"].column_name) or "").strip()
+            month = (a_month(row.get(cols["qualified_at"].column_name))
+                     if "qualified_at" in cols
+                     else a_month(became.get(deal)))
             if month is None:
                 no_qualified_date += 1
                 continue
@@ -1312,6 +1409,13 @@ def cost_per_qualified_opportunity(conn, engagement_id: str, heartbeat):
             "spend_rows_with_no_amount": spend_unpriced,
             "deals_read": deals,
             "deals_with_no_qualified_date": no_qualified_date,
+            # Where the date came from, because a reader should know
+            # whether it was recorded by the client or worked out from
+            # a stage somebody nominated.
+            "qualification_read_from": (
+                "a mapped column" if "qualified_at" in cols
+                else "the stage nominated on each pipeline"),
+            "qualification": counted,
             "deals_with_no_channel": no_channel,
             "qualified_opportunities": total_qualified,
             "total_spend": round(total_spend, 2),
@@ -1326,6 +1430,149 @@ def cost_per_qualified_opportunity(conn, engagement_id: str, heartbeat):
         "note": "Channel names are compared loosely across the two systems. "
                 "A channel appearing on one side only is either waste or a "
                 "naming mismatch, and the client will know which.",
+    }
+
+
+def cost_of_growth(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
+    """What a pound of new recurring revenue costs to acquire.
+
+    Cost per opportunity measures the top of the funnel. The person
+    commissioning an assessment owns the whole cost of revenue, and
+    their question is what the growth programme returns. A business can
+    buy opportunities cheaply and win nothing.
+
+    So the whole cost base, split into the kinds of cost a reader has to
+    see separately — a chief revenue officer looking at six million
+    needs to know four of it is salary before any ratio means anything —
+    against the revenue it bought.
+
+    New business only. A renewal booked this year was not acquired by
+    this year's spend, and on the client this was built for nine in ten
+    unassigned deals are renewals; counting them would halve the
+    apparent cost of growth. Where the client does not record a deal
+    type, that is said rather than assumed away.
+
+    Never by month. Spend in one year produces revenue in the next, so
+    a monthly ratio describes timing rather than efficiency. One figure
+    for the period, and the period is stated.
+    """
+    cols = resolve_columns(conn, engagement_id, "cost_of_growth")
+    needed = ["spend_amount", "spend_month", "opportunity_id",
+              "opportunity_status", "opportunity_amount",
+              "opportunity_close_date"]
+    problem = missing_fields(conn, engagement_id, "cost_of_growth", needed, cols)
+    if problem:
+        raise ValueError(problem)
+
+    heartbeat(0, 2)
+
+    # What was spent, by kind and by month.
+    kinds, months = Cut("kind of cost"), set()
+    spend_rows = undated = unpriced = 0
+    total_spend = 0.0
+    kind_col = cols["spend_kind"].column_name if "spend_kind" in cols else None
+    channel = Cut("channel")
+    channel_col = (cols["spend_channel"].column_name
+                   if "spend_channel" in cols else None)
+    for row in rows_of(conn, cols["spend_amount"]):
+        spend_rows += 1
+        amount = deal_value.clean(row.get(cols["spend_amount"].column_name))
+        if amount is None:
+            unpriced += 1
+            continue
+        when = a_month(row.get(cols["spend_month"].column_name))
+        if when is None:
+            undated += 1
+        else:
+            months.add(when)
+        total_spend += amount
+        kinds.add(row.get(kind_col) if kind_col else "not recorded", amount)
+        if channel_col:
+            channel.add(row.get(channel_col), amount)
+
+    heartbeat(1, 2)
+
+    # What was won, and what kind of business it was.
+    seen = Outcomes()
+    types = Cut("kind of business")
+    type_col = (cols["opportunity_type"].column_name
+                if "opportunity_type" in cols else None)
+    status_col = cols["opportunity_status"].column_name
+    amount_col = cols["opportunity_amount"].column_name
+    deals = won = unvalued = 0
+    won_value = new_business_value = 0.0
+    new_business_deals = 0
+    source = Cut("where it came from")
+    source_col = (cols["channel_source"].column_name
+                  if "channel_source" in cols else None)
+
+    for row in rows_of(conn, cols["opportunity_status"]):
+        deals += 1
+        if seen.classify(row.get(status_col)) != "won":
+            continue
+        won += 1
+        value = deal_value.clean(row.get(amount_col))
+        if value is None:
+            unvalued += 1
+            continue
+        won_value += value
+        kind = (row.get(type_col) or "").strip() if type_col else ""
+        types.add(kind or "not recorded", value)
+        if source_col:
+            source.add(row.get(source_col), value)
+        # New business, as the client labels it. Anything they call a
+        # renewal or an add-on was not acquired by this spend.
+        if pipeline_shape.motion_of(kind) == pipeline_shape.THE_FUNNEL:
+            new_business_value += value
+            new_business_deals += 1
+
+    seen.refuse_if_nothing_matched(status_col)
+    heartbeat(2, 2)
+
+    labelled = bool(type_col) and types.answered > 0
+    # The ratio a chief revenue officer asks for. New business where the
+    # client labels its deals, everything won where it does not — and
+    # the output says which, because the two are not comparable.
+    against = new_business_value if labelled else won_value
+    cost_per_pound = (round(total_spend / against, 4)
+                      if against > 0 else None)
+
+    period = (f"{min(months)} to {max(months)}" if months else "not known")
+    return won, {
+        "analysis": "cost_of_growth",
+        "the_period": period,
+        "months_of_spend": len(months),
+        "total_invested": round(total_spend, 2),
+        **kinds.as_dict(spend_rows),
+        "new_business_won": round(new_business_value, 2),
+        "all_revenue_won": round(won_value, 2),
+        "cost_per_pound_of_new_revenue": cost_per_pound,
+        "the_ratio_is_against": (
+            "new business only, as the client labels its deals"
+            if labelled else
+            "everything won, because the client does not record a deal "
+            "type — so renewals are in it and the figure flatters the "
+            "programme by whatever share of the book renews"),
+        "why_not_by_month": (
+            "Spend in one year produces revenue in the next, so this is "
+            "one figure for the whole period. A monthly version would "
+            "describe timing rather than efficiency."),
+        "by_kind_of_business": types.as_dict(won),
+        **({"by_channel": channel.as_dict(spend_rows)} if channel_col else {}),
+        **({"revenue_by_source": source.as_dict(won)} if source_col else {}),
+        "population": {
+            "spend_rows_read": spend_rows,
+            "spend_rows_with_no_amount": unpriced,
+            "spend_rows_with_no_month": undated,
+            "deals_read": deals,
+            "deals_won": won,
+            "won_deals_with_no_value": unvalued,
+            "new_business_deals_won": new_business_deals,
+        },
+        "gaps": [g.as_dict() for g in (
+            [Gap("won deals with no value recorded", unvalued,
+                 "they are counted but contribute nothing to the ratio")]
+            if unvalued else [])],
     }
 
 
@@ -1409,6 +1656,11 @@ def buying_group_composition(conn, engagement_id: str, heartbeat):
     if problem:
         raise ValueError(problem)
 
+    # What each deal is worth, where the client records it. A count
+    # of anything about deals invites the question of how much, and
+    # the answer should be in the same place as the count.
+    worth = deal_value.by_deal(conn, cols, rows_of)
+
     heartbeat(0, 3)
     outcomes = {}
     for row in rows_of(conn, cols["opportunity_id"]):
@@ -1442,7 +1694,10 @@ def buying_group_composition(conn, engagement_id: str, heartbeat):
                 orphan += 1
                 continue
             per_deal[deal].add(person)
-            roles.add(row.get(cols["contact_role"].column_name))
+            roles.add(row.get(cols["contact_role"].column_name),
+                        worth.get((row.get(cols["contact_opportunity_id"].column_name)
+                                   or "").strip())
+                        if "contact_opportunity_id" in cols else None)
             who = people.get(person)
             if who:
                 seniorities.add(who.get("seniority"))
@@ -1514,6 +1769,11 @@ def handover_completeness_census(conn, engagement_id: str, heartbeat):
     if problem:
         raise ValueError(problem)
 
+    # What each deal is worth, where the client records it. A count
+    # of anything about deals invites the question of how much, and
+    # the answer should be in the same place as the count.
+    worth = deal_value.by_deal(conn, cols, rows_of)
+
     seen = Outcomes()
     where, levels = segment_of(conn, engagement_id, cols["opportunity_id"])
     by_segment = BySegment([lv["label"] for lv in levels])
@@ -1543,7 +1803,10 @@ def handover_completeness_census(conn, engagement_id: str, heartbeat):
             deal = (row.get(cols["activity_opportunity_id"].column_name) or "").strip()
             if deal in won_deals:
                 has_activity.add(deal)
-                activity_types.add(row.get(cols["activity_type"].column_name))
+                activity_types.add(row.get(cols["activity_type"].column_name),
+                            worth.get((row.get(cols["activity_opportunity_id"].column_name)
+                                       or "").strip())
+                            if "activity_opportunity_id" in cols else None)
     heartbeat(3, 4)
 
     has_note = set()
@@ -1721,6 +1984,11 @@ def renewal_timing_and_reason(conn, engagement_id: str, heartbeat):
     if problem:
         raise ValueError(problem)
 
+    # What each deal is worth, where the client records it. A count
+    # of anything about deals invites the question of how much, and
+    # the answer should be in the same place as the count.
+    worth = deal_value.by_deal(conn, cols, rows_of)
+
     outcomes, reasons = Cut("renewal outcome"), Cut("reason for not renewing")
     lead_days: list[int] = []
     rows = no_dates = not_renewed = 0
@@ -1750,7 +2018,10 @@ def renewal_timing_and_reason(conn, engagement_id: str, heartbeat):
             by_segment.add(path, "renewed" if renewed else "did not renew")
             if "non_renewal_reason" in cols and not renewed:
                 not_renewed += 1
-                reasons.add(row.get(cols["non_renewal_reason"].column_name))
+                reasons.add(row.get(cols["non_renewal_reason"].column_name),
+                            worth.get((row.get(cols["subscription_id"].column_name)
+                                       or "").strip())
+                            if "subscription_id" in cols else None)
             if end_col:
                 settled = a_date(row.get(cols["renewal_date"].column_name))
                 ends = a_date(row.get(end_col))
@@ -2995,6 +3266,41 @@ def _store_pipelines(conn, engagement_id, events, eras, deal_segment,
                     (engagement_id,))
         cur.execute("delete from pipeline where engagement_id = %s",
                     (engagement_id,))
+
+        # Every dated arrival, written down.
+        #
+        # The table exists and detection has only ever emptied it, so
+        # the screen has said "0 stage entries" on every pipeline since
+        # it was built. Anything downstream wanting to know when a deal
+        # reached a stage found nothing, which is how a qualification
+        # date worked out from exactly these rows came back empty on a
+        # client with a full stage history.
+        #
+        # Written once per deal rather than once per segment level: a
+        # deal belongs to "all deals" and to its own division and to
+        # every level between, and its arrival at a stage happened once.
+        # The segment recorded is the deepest one it has.
+        for deal, moves in events.items():
+            path = deal_segment.get(deal, [])
+            label = " · ".join(path) if path else "all deals"
+            seen = Counter(era_of.get(m["stage"], 1) for m in moves)
+            era = seen.most_common(1)[0][0] if seen else 1
+            for m in moves:
+                # Only what was recorded. An inferred stage has no date,
+                # and a row here claiming one would invent the thing the
+                # rest of this file is careful not to invent.
+                if m["when"] is None:
+                    continue
+                if era_of.get(m["stage"], 1) != era and not _is_outcome(m["stage"]):
+                    continue
+                cur.execute("""
+                    insert into deal_stage_entry (engagement_id, opportunity_id,
+                           segment, era, stage_name, entered_at)
+                         values (%s,%s,%s,%s,%s,%s)
+                    on conflict (engagement_id, opportunity_id, stage_name, era)
+                    do update set entered_at = least(
+                           deal_stage_entry.entered_at, excluded.entered_at)
+                """, (engagement_id, deal, label, era, m["stage"], m["when"]))
         for (path, era), items in sorted(
                 buckets.items(), key=lambda kv: (len(kv[0][0]), kv[0])):
             label = " · ".join(path) if path else "all deals"
@@ -3410,6 +3716,7 @@ BUILT = {
     "price_discount_dispersion": price_discount_dispersion,
     "stage_conversion_and_duration": stage_conversion_and_duration,
     "cost_per_qualified_opportunity": cost_per_qualified_opportunity,
+    "cost_of_growth": cost_of_growth,
     "forecast_accuracy": forecast_accuracy,
     "buying_group_composition": buying_group_composition,
     "handover_completeness_census": handover_completeness_census,
