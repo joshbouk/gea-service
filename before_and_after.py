@@ -16,6 +16,16 @@ somebody before it reaches a client.
 
 The rule this exists to enforce: no analysis change ships without being
 run against real data, with the before and after shown.
+
+It changes nothing in the database. Two analyses save what they find:
+detect_pipeline rebuilds the pipelines, and synthesise_interview reads
+the next transcript and stores its findings. Run from here, both used
+to commit, so a comparison taken while the mappings were broken rebuilt
+the pipelines from broken mappings, lost the qualifying stages stored on
+them, and read an interview nobody had asked to read. Now every analysis
+runs inside one transaction that is rolled back at the end, and the ones
+that ask the model are not run at all: they cost money, and a model's
+answer differs run to run, so a difference proves nothing.
 """
 from __future__ import annotations
 
@@ -29,6 +39,42 @@ import psycopg
 import analyses
 
 HERE = pathlib.Path(__file__).parent / ".answers"
+
+
+# Read with the model. Not run here; see the note at the top.
+ASKS_THE_MODEL = {
+    "synthesise_interview",
+    "note_sufficiency",
+    "discovery_consistency_classification",
+    "adversarial_score_review",
+}
+
+
+class Sandbox:
+    """The connection as an analysis sees it, with commit taken away.
+
+    An analysis that commits gets a savepoint instead, and one that rolls
+    back goes back to that savepoint, so inside the run everything behaves
+    as it would for the worker: a later analysis sees the pipelines an
+    earlier one stored. The whole transaction is rolled back at the end.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+        with conn.cursor() as cur:
+            cur.execute("savepoint before_and_after")
+
+    def commit(self):
+        with self._conn.cursor() as cur:
+            cur.execute("release savepoint before_and_after")
+            cur.execute("savepoint before_and_after")
+
+    def rollback(self):
+        with self._conn.cursor() as cur:
+            cur.execute("rollback to savepoint before_and_after")
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
 
 
 def shape_of(output: dict) -> dict:
@@ -77,17 +123,23 @@ def run_them_all(conn, engagement_id: str) -> dict:
         # Said out loud, because some of these read a hundred and fifty
         # thousand rows and a silent minute looks like a hang.
         print(f"  [{n}/{total}] {key}", flush=True)
+        if key in ASKS_THE_MODEL:
+            out[key] = {"skipped": True}
+            print("          not run here: it asks the model", flush=True)
+            continue
         try:
             _n, result = fn(conn, engagement_id, lambda a, b: None)
             out[key] = {"ran": True, "shape": shape_of(result)}
             print(f"          ran", flush=True)
         except ValueError as exc:
+            conn.rollback()
             # Not an error. An analysis that cannot run on this client's
             # evidence says so, and that is itself worth watching: a
             # change that makes one stop running is a change to notice.
             out[key] = {"ran": False, "why": str(exc)[:200]}
             print(f"          cannot run yet: {str(exc)[:70]}", flush=True)
         except Exception as exc:
+            conn.rollback()
             out[key] = {"ran": False, "broke": f"{type(exc).__name__}: {exc}"[:200]}
             print(f"          BROKE: {type(exc).__name__}: {exc}"[:90], flush=True)
     print("  reading the pipelines", flush=True)
@@ -101,6 +153,8 @@ def differences(before: dict, after: dict) -> list[str]:
         if key == "_pipelines":
             continue
         b, a = before.get(key), after.get(key)
+        if (b or {}).get("skipped") or (a or {}).get("skipped"):
+            continue
         if b is None:
             said.append(f"  {key}: new")
         elif a is None:
@@ -159,8 +213,13 @@ def main() -> int:
     HERE.mkdir(exist_ok=True)
     kept = HERE / f"{engagement_id}.json"
 
-    with psycopg.connect(dsn) as conn:
-        now = run_them_all(conn, engagement_id)
+    # Not "with psycopg.connect(...) as conn": leaving that block commits.
+    conn = psycopg.connect(dsn)
+    try:
+        now = run_them_all(Sandbox(conn), engagement_id)
+    finally:
+        conn.rollback()
+        conn.close()
 
     if what == "record":
         kept.write_text(json.dumps(now, indent=1, default=str))
