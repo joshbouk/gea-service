@@ -750,6 +750,7 @@ def icp_reconciliation(conn, engagement_id: str, heartbeat) -> tuple[int, dict]:
                 unmatched += 1
                 continue
 
+            deal = (row.get(cols["opportunity_id"].column_name) or "").strip()
             add_firmographics(cuts, acct, worth.get(deal))
     heartbeat(2, 2)
 
